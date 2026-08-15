@@ -14,7 +14,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "db")
 DEFAULT_DB_PATH = os.path.join(DB_DIR, "papergrep.db")
 
-PAGE_SIZE = 20
+PAGE_SIZE = 50
 
 
 # ============================================================
@@ -121,6 +121,7 @@ def _parse_filters(query_dict):
     disl = query_dict.get('filter_disliked', [None])[0]
     shared = query_dict.get('filter_shared', [None])[0]
     unread = query_dict.get('filter_unread', [None])[0]
+    exclude_disl = query_dict.get('filter_exclude_disliked', [None])[0]
     if fav == '1':
         where_parts.append("is_favorite=1")
     if disl == '1':
@@ -129,6 +130,8 @@ def _parse_filters(query_dict):
         where_parts.append("is_shared=1")
     if unread == '1':
         where_parts.append("is_read=0")
+    if exclude_disl == '1':
+        where_parts.append("(is_disliked IS NULL OR is_disliked=0)")
     return where_parts, params
 
 
@@ -474,6 +477,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .badge-unread { background: #fce7f3; color: #9d174d; }
   .paper-title { font-weight: 500; color: #1e40af; cursor: pointer; }
   .paper-title:hover { text-decoration: underline; }
+  .paper-title-en { font-size: 12px; color: #6b7280; margin-top: 2px; font-weight: 400; line-height: 1.4; }
   .paper-meta { font-size: 12px; color: #6b7280; margin-top: 3px; }
   .action-btn { padding: 3px 9px; border: 1px solid #d1d5db; border-radius: 5px; background: #fff; cursor: pointer; font-size: 12px; margin: 1px 2px; }
   .action-btn.on { background: #2563eb; color: #fff; border-color: #2563eb; }
@@ -547,7 +551,7 @@ const esc = (s) => (s == null ? '' : String(s)).replace(/[&<>"']/g, c => ({'&':'
 
 const state = {
   tab: 'dashboard',
-  papers: { page: 0, sort: 'likes', search: '', filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0 },
+  papers: { page: 0, sort: 'likes', search: '', filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0, filter_exclude_disliked: 0 },
   comments: { page: 0, paper_id: null },
   runs: { page: 0 },
   runDetail: { view: 'summary' },
@@ -677,6 +681,7 @@ async function renderPapers() {
     filter_disliked: state.papers.filter_disliked,
     filter_shared: state.papers.filter_shared,
     filter_unread: state.papers.filter_unread,
+    filter_exclude_disliked: state.papers.filter_exclude_disliked,
   });
   const data = await apiGet('/api/papers?' + qp);
   const sortOpts = data.sort_options || {};
@@ -698,6 +703,9 @@ async function renderPapers() {
       </label>
       <label class="filter-check ${state.papers.filter_shared?'on':''}">
         <input type="checkbox" id="fSha" ${state.papers.filter_shared?'checked':''}/> 📤 已分享
+      </label>
+      <label class="filter-check ${state.papers.filter_exclude_disliked?'on':''}">
+        <input type="checkbox" id="fExDis" ${state.papers.filter_exclude_disliked?'checked':''}/> 🚫 排除不喜欢
       </label>
       <button id="btnSearch">搜索</button>
       <button id="btnReset">重置</button>
@@ -723,7 +731,10 @@ async function renderPapers() {
             <td>${data.page * data.size + i + 1}</td>
             <td><code style="font-size:12px">${esc(p.paper_id)}</code></td>
             <td>
-              <div class="paper-title" data-pid="${p.paper_id}">${esc(p.title_display || p.paper_id)}</div>
+              ${(p.title_zh && p.title_en && p.title_zh !== p.title_en)
+                ? ('<div class="paper-title" data-pid="' + p.paper_id + '">' + esc(p.title_zh) + '</div><div class="paper-title-en">' + esc(p.title_en) + '</div>')
+                : ('<div class="paper-title" data-pid="' + p.paper_id + '">' + esc(p.title_zh || p.title_en || p.paper_id) + '</div>')
+              }
               <div class="paper-meta">${esc(p.authors_display || '')}</div>
               <div class="paper-meta" style="margin-top:4px;">${markBadges(p)}</div>
             </td>
@@ -743,11 +754,11 @@ async function renderPapers() {
   $('#searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
   $('#btnSearch').addEventListener('click', doSearch);
   $('#btnReset').addEventListener('click', () => {
-    state.papers = { page: 0, sort: 'likes', search: '', filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0 };
+    state.papers = { page: 0, sort: 'likes', search: '', filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0, filter_exclude_disliked: 0 };
     renderPapers();
   });
   $('#sortSel').addEventListener('change', (e) => { state.papers.sort = e.target.value; state.papers.page = 0; renderPapers(); });
-  for (const [id, key] of [['fUnread','filter_unread'],['fFav','filter_fav'],['fDis','filter_disliked'],['fSha','filter_shared']]) {
+  for (const [id, key] of [['fUnread','filter_unread'],['fFav','filter_fav'],['fDis','filter_disliked'],['fSha','filter_shared'],['fExDis','filter_exclude_disliked']]) {
     $(`#${id}`).addEventListener('change', (e) => { state.papers[key] = e.target.checked ? 1 : 0; state.papers.page = 0; renderPapers(); });
   }
   $$('.paper-title').forEach(el => el.addEventListener('click', () => {
@@ -840,10 +851,9 @@ async function renderPaperDetail(pid) {
     </div>
   ` : '';
 
-  const overviewSection = (p.ai_overview_summary_zh || p.ai_overview_zh || p.ai_overview_en) ? `
+  const overviewSection = (p.ai_overview_zh || p.ai_overview_en) ? `
     <div class="detail-section"><h3>🤖 AI 概述</h3>
-      ${p.ai_overview_summary_zh ? `<h4 style="margin:6px 0 4px; font-size:13px; color:#64748b;">简短总结 (中文)</h4><div class="content-block" style="background:#ecfdf5;">${esc(p.ai_overview_summary_zh)}</div>` : ''}
-      ${p.ai_overview_zh ? `<h4 style="margin:10px 0 4px; font-size:13px; color:#64748b;">完整概述 (中文)</h4><div class="content-block">${esc(p.ai_overview_zh)}</div>` : ''}
+      ${p.ai_overview_zh ? `<h4 style="margin:6px 0 4px; font-size:13px; color:#64748b;">中文概述（约 ${p.ai_overview_zh.length} 字）</h4><div class="content-block">${esc(p.ai_overview_zh)}</div>` : ''}
       ${p.ai_overview_en ? `<h4 style="margin:10px 0 4px; font-size:13px; color:#64748b;">English Overview</h4><div class="content-block">${esc(p.ai_overview_en)}</div>` : ''}
     </div>
   ` : '';
@@ -860,7 +870,6 @@ async function renderPaperDetail(pid) {
       <div class="k">title_zh 已翻译</div><div class="v">${tf.title_zh ? '✅ 是' : '— 否'} ${p.title_zh ? '(当前有值)' : ''}</div>
       <div class="k">abstract_zh 已翻译</div><div class="v">${tf.abstract_zh ? '✅ 是' : '— 否'} ${p.abstract_zh ? '(当前有值)' : ''}</div>
       <div class="k">ai_overview_zh 已翻译</div><div class="v">${tf.ai_overview_zh ? '✅ 是' : '— 否'} ${p.ai_overview_zh ? '(当前有值)' : ''}</div>
-      <div class="k">ai_overview_summary_zh</div><div class="v">${tf.ai_overview_summary_zh ? '✅ 是' : '— 否'} ${p.ai_overview_summary_zh ? '(当前有值)' : ''}</div>
     </div>
   `;
 

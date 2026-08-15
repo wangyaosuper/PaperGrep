@@ -317,28 +317,23 @@ def show_paper_detail(conn, paper_id):
                     print(f"  英文摘要: (存在 {len(abs_en)} 字符，输入 [ae] 查看)")
                     print()
 
-        ov_s_zh = d.get('ai_overview_summary_zh') or ''
         ov_zh = d.get('ai_overview_zh') or ''
         ov_en = d.get('ai_overview_en') or ''
-        if ov_s_zh or ov_zh or ov_en:
+        if ov_zh or ov_en:
             print_separator('-')
             print("  🤖 AI 概述")
             print_separator('-')
-            if ov_s_zh:
-                print("  简短总结 (中文):")
-                print(wrap_text(ov_s_zh, indent=4))
-                print()
             if ov_zh:
-                print("  完整概述 (中文):")
+                print(f"  中文概述（约 {len(ov_zh)} 字）:")
                 print(wrap_text(ov_zh, indent=4))
                 print()
             if ov_en:
                 if show_ov_en:
-                    print("  完整概述 (英文):")
+                    print("  英文概述:")
                     print(wrap_text(ov_en, indent=4))
                     print()
                 else:
-                    print(f"  完整概述 (英文): (存在 {len(ov_en)} 字符，输入 [oe] 查看)")
+                    print(f"  英文概述: (存在 {len(ov_en)} 字符，输入 [oe] 查看)")
                     print()
 
         c.execute("SELECT COUNT(*) FROM comments WHERE paper_id = ?", (paper_id,))
@@ -390,7 +385,6 @@ def show_paper_detail(conn, paper_id):
             print(f"  title_zh 已翻译:      {'✓' if tf.get('title_zh') else '-'}  (当前: {'有' if d.get('title_zh') else '无'})")
             print(f"  abstract_zh 已翻译:   {'✓' if tf.get('abstract_zh') else '-'}  (当前: {'有' if d.get('abstract_zh') else '无'})")
             print(f"  ai_overview_zh 已翻译:{'✓' if tf.get('ai_overview_zh') else '-'}  (当前: {'有' if d.get('ai_overview_zh') else '无'})")
-            print(f"  ai_overview_summary_zh:{'✓' if tf.get('ai_overview_summary_zh') else '-'}  (当前: {'有' if d.get('ai_overview_summary_zh') else '无'})")
             print()
             input("  按 Enter 继续...")
         elif cmd == 'r':

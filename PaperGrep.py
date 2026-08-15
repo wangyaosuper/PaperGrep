@@ -909,7 +909,7 @@ class LLMTranslator:
             "",
             "For each input i, output JSON value at position i:",
             "  - For TITLE / ABSTRACT / COMMENT inputs: output a single STRING (the full Chinese translation).",
-            "  - For AI OVERVIEW inputs: output a single STRING — a Chinese summary of about 300 characters, covering: 研究问题背景, 核心方法, 关键创新点, 主要实验结果与结论。Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce a clean, readable 300-char Chinese summary.",
+            "  - For AI OVERVIEW inputs: output a single STRING — a Chinese summary of about 1500 characters, covering: 研究问题与动机, 相关工作与痛点, 核心方法与技术细节, 关键创新点, 主要实验设置, 实验结果与分析, 局限性与未来方向, 结论与应用价值。Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce a structured, readable ~1500-character Chinese overview.",
             "",
             "Wrap all outputs in a single top-level JSON object in the format: {\"0\": value0, \"1\": value1, ...}.",
             "Output JSON ONLY, no prose, no markdown fences.",
@@ -919,7 +919,7 @@ class LLMTranslator:
         for idx, ((k, text), meta) in enumerate(zip(chunk_items, chunk_metas)):
             clean = str(text).replace('\r', ' ').replace('\n', '\\n').replace('\"', '\\"')
             if meta['kind'] == 'OVERVIEW':
-                mode = 'AI OVERVIEW → 返回字符串（中文约 300 字总结，非逐字翻译）'
+                mode = 'AI OVERVIEW → 返回字符串（中文约 1500 字结构化概述，非逐字翻译）'
             else:
                 mode = f"{meta['kind']} → 返回字符串（中文完整翻译）"
             prompt_parts.append(f"{idx}. [MODE: {mode}] {clean}")
@@ -936,7 +936,7 @@ class LLMTranslator:
             "    <your translated content for item i>",
             "  </item_i>",
             "  - For TITLE / ABSTRACT / COMMENT inputs: content inside the tags is a plain Chinese string (full translation).",
-            "  - For AI OVERVIEW inputs: content inside the tags is a plain Chinese string — a summary of about 300 characters, covering: 研究问题背景, 核心方法, 关键创新点, 主要实验结果与结论。Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce a clean, readable 300-char Chinese summary.",
+            "  - For AI OVERVIEW inputs: content inside the tags is a plain Chinese string — a structured overview of about 1500 characters, covering: 研究问题与动机, 相关工作与痛点, 核心方法与技术细节, 关键创新点, 主要实验设置, 实验结果与分析, 局限性与未来方向, 结论与应用价值。Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce a readable ~1500-character Chinese overview.",
             "",
             "CRITICAL RULES for the XML delimiter format:",
             "  1. NEVER write the literal strings '</item_' anywhere inside the translated content itself. If the source contains them, rewrite slightly or insert a zero-width space.",
@@ -949,7 +949,7 @@ class LLMTranslator:
         for idx, ((k, text), meta) in enumerate(zip(chunk_items, chunk_metas)):
             clean = str(text).replace('\r', ' ').replace('\n', '\\n')
             if meta['kind'] == 'OVERVIEW':
-                mode = 'AI OVERVIEW → 标签内填中文（约 300 字总结，非逐字翻译）'
+                mode = 'AI OVERVIEW → 标签内填中文（约 1500 字结构化概述，非逐字翻译）'
             else:
                 mode = f"{meta['kind']} → 标签内填中文（纯文本，完整翻译）"
             prompt_parts.append(f"{idx}. [MODE: {mode}] {clean}")
@@ -1207,7 +1207,7 @@ class LLMTranslator:
 
     def _apply_parsed_to_results(self, parsed, chunk_items, chunk_metas, results_accum):
         """Common logic: given parsed {idx_str -> raw_value} dict, fill results_accum
-        with properly normalized values. OVERVIEW now is a plain 300-char Chinese summary string."""
+        with properly normalized values. OVERVIEW now is a plain ~1000-char Chinese overview string."""
         miss_count = 0
         for idx, (key, _) in enumerate(chunk_items):
             raw = parsed.get(str(idx))
@@ -1301,7 +1301,7 @@ class LLMTranslator:
 
     def translate_batch(self, items, source_lang='English', target_lang='Chinese'):
         """items: list of (key, text). key 前缀 TITLE_/ABSTRACT_/OVERVIEW_*/COMMENT_ 用来识别类型。
-        返回 dict key -> value：TITLE/ABSTRACT/COMMENT 为字符串；OVERVIEW_* 为 JSON string 形如 {"summary":"短中文", "full":"完整中文"}。"""
+        返回 dict key -> value：均为字符串，其中 OVERVIEW 是约 1500 字中文结构化概述。"""
         items = [(k, t) for (k, t) in items if t and str(t).strip()]
         if not items:
             self._debug("translate_batch: items empty, return {}")
@@ -1497,7 +1497,6 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
             if (prev['ai_overview_en'] or '') != (ai_overview_incoming or ''):
                 changes.append({'field': 'ai_overview_en', 'before_len': len(prev['ai_overview_en'] or ''), 'after_len': len(ai_overview_incoming)})
             translated.pop('ai_overview_zh', None)
-            translated.pop('ai_overview_summary_zh', None)
             store_overview = ai_overview_incoming
             store_overview_hash = new_ai_overview_hash
         else:
@@ -1543,7 +1542,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
         WHERE (translated_fields IS NULL OR json_extract(translated_fields, '$.title_zh') IS NULL AND title_en IS NOT NULL AND title_en != '')
            OR (translated_fields IS NULL OR json_extract(translated_fields, '$.abstract_zh') IS NULL AND abstract_en IS NOT NULL AND abstract_en != '')
            OR (translated_fields IS NULL OR (
-                 (json_extract(translated_fields, '$.ai_overview_zh') IS NULL OR json_extract(translated_fields, '$.ai_overview_summary_zh') IS NULL)
+                 json_extract(translated_fields, '$.ai_overview_zh') IS NULL
                  AND ai_overview_en IS NOT NULL AND ai_overview_en != ''
               ))
         ORDER BY first_seen DESC
@@ -1571,9 +1570,8 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
             tasks.append((f"TITLE::{r['paper_id']}", r['title_en']))
         if r['abstract_en'] and not translated.get('abstract_zh'):
             tasks.append((f"ABSTRACT::{r['paper_id']}", r['abstract_en']))
-        # AI Overview: 直接生成约 300 字中文总结（不再做完整翻译，避免公式/伪代码翻译失真）
-        # DB 中 ai_overview_zh 和 ai_overview_summary_zh 都存这份总结
-        if r['ai_overview_en'] and (not translated.get('ai_overview_zh') or not translated.get('ai_overview_summary_zh')):
+        # AI Overview: 生成约 1500 字中文结构化概述（覆盖 8 个维度：动机/相关工作/方法细节/创新点/实验设置/结果分析/局限与未来/应用价值；不做逐字翻译避免公式/伪代码失真）
+        if r['ai_overview_en'] and not translated.get('ai_overview_zh'):
             tasks.append((f"OVERVIEW::{r['paper_id']}", r['ai_overview_en']))
 
     # Also collect untranslated comments (补全所有历史缺译评论，不限制条数以保证数据库一致性)
@@ -1590,8 +1588,8 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
     print(f"[INFO] [5/7] 调用大模型翻译：共 {len(tasks)} 项待翻译 (model={translator.model}) …")
     if tasks:
         route = 'DashScope 原生 SDK' if translator.model == 'qwen-plus' else 'OpenAI 兼容接口'
-        overview_cnt = sum(1 for (k, _) in tasks if k.startswith('OVERVIEW_'))
-        print(f"[INFO]   使用路由：{route}  批量条目：{len(tasks)}（其中 AI Overview 翻译+总结：{overview_cnt}）")
+        overview_cnt = sum(1 for (k, _) in tasks if k.startswith('OVERVIEW'))
+        print(f"[INFO]   使用路由：{route}  批量条目：{len(tasks)}（其中 AI Overview ~1500字中文结构化概述：{overview_cnt}）")
         translated_map = translator.translate_batch(tasks)
         got = len(translated_map)
         print(f"[INFO]   翻译返回：{got}/{len(tasks)} 条结果")
@@ -1604,27 +1602,24 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
             kind, _, rest = key.partition('::')
             if kind == 'TITLE':
                 pid = rest
-                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'ai_overview_summary_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
+                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
                 prev['title_zh'] = zh
                 prev['translated']['title_zh'] = True
                 by_paper_updates[pid] = prev
             elif kind == 'ABSTRACT':
                 pid = rest
-                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'ai_overview_summary_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
+                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
                 prev['abstract_zh'] = zh
                 prev['translated']['abstract_zh'] = True
                 by_paper_updates[pid] = prev
             elif kind == 'OVERVIEW_B' or kind == 'OVERVIEW_S' or kind == 'OVERVIEW_F' or kind == 'OVERVIEW':
-                # OVERVIEW 现在是纯字符串：约 300 字中文总结（非完整翻译）
-                # DB 中 ai_overview_zh 和 ai_overview_summary_zh 都存这份总结（保持字段兼容）
+                # OVERVIEW 是纯字符串：约 1500 字中文结构化概述（非逐字翻译；覆盖 8 个维度从动机到应用价值）
                 pid = rest
-                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'ai_overview_summary_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
-                summary_text = str(zh).strip()
-                if summary_text:
-                    prev['ai_overview_zh'] = summary_text
-                    prev['ai_overview_summary_zh'] = summary_text
+                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
+                overview_text = str(zh).strip()
+                if overview_text:
+                    prev['ai_overview_zh'] = overview_text
                     prev['translated']['ai_overview_zh'] = True
-                    prev['translated']['ai_overview_summary_zh'] = True
                 by_paper_updates[pid] = prev
             elif kind == 'COMMENT':
                 try:
@@ -1638,7 +1633,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
             title_zh = up['title_zh'] if up['title_zh'] is not None else r['title_zh']
             abstract_zh = up['abstract_zh'] if up['abstract_zh'] is not None else r['abstract_zh']
             overview_zh = up['ai_overview_zh'] if up['ai_overview_zh'] is not None else r['ai_overview_zh']
-            overview_s_zh = up['ai_overview_summary_zh'] if up['ai_overview_summary_zh'] is not None else r['ai_overview_summary_zh']
+            overview_s_zh = overview_zh
             c.execute("""
                 UPDATE papers SET title_zh=?, abstract_zh=?, ai_overview_zh=?, ai_overview_summary_zh=?, translated_fields=?, last_updated=?
                 WHERE paper_id=?
@@ -1660,9 +1655,12 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
                     updated_markers.append(nc)
             new_comments[:] = updated_markers
         conn.commit()
-        summary_cnt = sum(1 for up in by_paper_updates.values() if up.get('ai_overview_summary_zh'))
-        full_cnt = sum(1 for up in by_paper_updates.values() if up.get('ai_overview_zh'))
-        print(f"[INFO]   翻译写入完成：论文字段 {len(by_paper_updates)} 条（其中 Overview 完整翻译 {full_cnt}，短总结 {summary_cnt}），评论 {len(comment_updates)} 条")
+        overview_cnt = sum(1 for up in by_paper_updates.values() if up.get('ai_overview_zh'))
+        title_tr_cnt = sum(1 for up in by_paper_updates.values() if up.get('title_zh'))
+        abs_tr_cnt = sum(1 for up in by_paper_updates.values() if up.get('abstract_zh'))
+        print(f"[INFO]   翻译写入完成：论文字段 {len(by_paper_updates)} 条"
+              f"（标题翻译 {title_tr_cnt}，摘要翻译 {abs_tr_cnt}，AI Overview ~1500字结构化概述 {overview_cnt}），"
+              f"评论 {len(comment_updates)} 条")
     else:
         print(f"[INFO]   没有需要翻译的内容（全部已翻译或英文无变化），跳过 LLM 调用")
 
@@ -1692,12 +1690,6 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
                 'before_len': len(r.get('ai_overview_zh') or ''),
                 'after_len': len(up['ai_overview_zh']),
                 'preview': _clip(up['ai_overview_zh'], 160),
-            }
-        if up.get('ai_overview_summary_zh') is not None:
-            fields_changed['ai_overview_summary_zh'] = {
-                'before_len': len(r.get('ai_overview_summary_zh') or ''),
-                'after_len': len(up['ai_overview_summary_zh']),
-                'preview': _clip(up['ai_overview_summary_zh'], 160),
             }
         if fields_changed:
             translation_updates.append({
@@ -1876,11 +1868,9 @@ def build_and_save_report(conn, new_paper_ids, updated, new_comments, ranking_be
         n_title = sum(1 for t in translation_updates if 'title_zh' in t['fields'])
         n_abs = sum(1 for t in translation_updates if 'abstract_zh' in t['fields'])
         n_ov = sum(1 for t in translation_updates if 'ai_overview_zh' in t['fields'])
-        n_ovs = sum(1 for t in translation_updates if 'ai_overview_summary_zh' in t['fields'])
         w(f"| 🌐 标题翻译补充 | **{n_title}** 篇 |")
         w(f"| 🌐 摘要翻译补充 | **{n_abs}** 篇 |")
-        w(f"| 🌐 AI Overview 完整翻译 | **{n_ov}** 篇 |")
-        w(f"| 🌐 AI Overview 简短总结 | **{n_ovs}** 篇 |")
+        w(f"| 🌐 AI Overview ~1500 字结构化概述 | **{n_ov}** 篇 |")
     if comment_translations:
         w(f"| 🌐 评论翻译补充 | **{len(comment_translations)}** 条 |")
     w()
@@ -1929,16 +1919,16 @@ def build_and_save_report(conn, new_paper_ids, updated, new_comments, ranking_be
                 w(p['abstract_en'].strip())
                 w()
 
-        has_overview = bool(p.get('ai_overview_summary_zh') or p.get('ai_overview_zh'))
+        has_overview = bool(p.get('ai_overview_zh'))
         if has_overview:
             w("#### 🤖 AI 概述")
             w()
-            short_zh = p.get('ai_overview_summary_zh') or p.get('ai_overview_zh')
-            if short_zh:
-                len_note = f"（约 {len(short_zh)} 字）"
-                w(f"**中文总结** {len_note}：")
+            overview_zh = p.get('ai_overview_zh') or ''
+            if overview_zh:
+                len_note = f"（约 {len(overview_zh)} 字）"
+                w(f"**中文结构化概述** {len_note}：")
                 w()
-                w(f"> {short_zh.strip()}")
+                w(f"> {overview_zh.strip()}")
                 w()
 
     # ---- Section 2: 更新论文 ----
@@ -1979,15 +1969,14 @@ def build_and_save_report(conn, new_paper_ids, updated, new_comments, ranking_be
                 w()
                 w(f"- Paper ID：`{tr['paper_id']}`")
                 fs = tr.get('fields') or {}
-                for fkey in ('title_zh', 'abstract_zh', 'ai_overview_summary_zh', 'ai_overview_zh'):
+                for fkey in ('title_zh', 'abstract_zh', 'ai_overview_zh'):
                     if fkey not in fs:
                         continue
                     v = fs[fkey]
                     label_map = {
                         'title_zh': '标题翻译',
                         'abstract_zh': '摘要翻译',
-                        'ai_overview_summary_zh': 'AI Overview 简短总结',
-                        'ai_overview_zh': 'AI Overview 完整翻译/总结',
+                        'ai_overview_zh': 'AI Overview 结构化概述',
                     }
                     len_before = v.get('before_len') or 0
                     len_after = v.get('after_len') or 0
@@ -2118,12 +2107,10 @@ def build_and_save_report(conn, new_paper_ids, updated, new_comments, ranking_be
         n_title = sum(1 for t in translation_updates if 'title_zh' in t['fields'])
         n_abs = sum(1 for t in translation_updates if 'abstract_zh' in t['fields'])
         n_ov = sum(1 for t in translation_updates if 'ai_overview_zh' in t['fields'])
-        n_ovs = sum(1 for t in translation_updates if 'ai_overview_summary_zh' in t['fields'])
         trans_items = []
         if n_title: trans_items.append(f"标题翻译补充 {n_title} 篇")
         if n_abs: trans_items.append(f"摘要翻译补充 {n_abs} 篇")
-        if n_ov: trans_items.append(f"Overview 完整翻译 {n_ov} 篇")
-        if n_ovs: trans_items.append(f"Overview 简短总结 {n_ovs} 篇")
+        if n_ov: trans_items.append(f"AI Overview 结构化概述 {n_ov} 篇")
         if trans_items:
             summary_parts.append("；".join(trans_items))
     if comment_translations:
@@ -2187,12 +2174,10 @@ def build_and_save_report(conn, new_paper_ids, updated, new_comments, ranking_be
         n_t = sum(1 for t in translation_updates if 'title_zh' in t['fields'])
         n_a = sum(1 for t in translation_updates if 'abstract_zh' in t['fields'])
         n_o = sum(1 for t in translation_updates if 'ai_overview_zh' in t['fields'])
-        n_os = sum(1 for t in translation_updates if 'ai_overview_summary_zh' in t['fields'])
         parts = []
         if n_t: parts.append(f"标题翻译 {n_t}")
         if n_a: parts.append(f"摘要翻译 {n_a}")
-        if n_o: parts.append(f"Overview翻译 {n_o}")
-        if n_os: parts.append(f"Overview总结 {n_os}")
+        if n_o: parts.append(f"AI Overview 中文概述 {n_o}")
         if parts:
             print(f"  🌐 论文翻译补充    {' | '.join(parts)}  篇")
     if comment_translations:
