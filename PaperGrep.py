@@ -561,7 +561,27 @@ def fetch_paper_details(paper_url, timeout=20):
                     pass
 
         # Comments
-        comments = _extract_comments(soup, html)
+        # Extract group UUID for alphaXiv SPA pages; required to call the comments REST API
+        # (SSR ships only a TanStack Query queryKey placeholder, no comment content)
+        group_uuid = None
+        paper_host = 'https://www.alphaxiv.org'
+        try:
+            from urllib.parse import urlparse
+            pu = urlparse(paper_url)
+            if pu.scheme and pu.netloc:
+                paper_host = f'{pu.scheme}://{pu.netloc}'
+        except Exception:
+            pass
+        # Pattern 1: $R[N]=["paper-group","<UUID>","comments"]  (TanStack Query dehydrated queryKey)
+        m = re.search(r'\$R\s*\[\s*\d+\s*\]\s*=\s*\[\s*"paper-group"\s*,\s*"([0-9a-fA-F-]{36})"\s*,\s*"comments"\s*\]', html)
+        if m:
+            group_uuid = m.group(1)
+        else:
+            # Pattern 2: plain "groupId":"<UUID>" in any JSON blobs / window bootstrapping scripts
+            m2 = re.search(r'"groupId"\s*:\s*"([0-9a-fA-F-]{36})"', html)
+            if m2:
+                group_uuid = m2.group(1)
+        comments = _extract_comments(soup, html, group_uuid=group_uuid, paper_host=paper_host)
         if comments:
             result['comments'] = comments
             result['comment_count'] = len(comments)
@@ -571,10 +591,45 @@ def fetch_paper_details(paper_url, timeout=20):
     return result
 
 
-def _extract_comments(soup, html_raw):
-    """Attempt to extract comments from soup; alphaXiv may also embed them in JSON."""
+def _extract_comments(soup, html_raw, group_uuid=None, paper_host='https://www.alphaxiv.org'):
+    """Attempt to extract comments from soup; alphaXiv may also embed them in JSON
+    or defer them behind an async REST endpoint on api.alphaxiv.org (requires group UUID).
+
+    Strategy order (alphaXiv): try api.alphaxiv.org FIRST (authoritative & structured),
+    then fall back to inline JSON, then DOM.  Reason: SSR DOM often contains empty
+    discussion-section wrappers / headers that can masquerade as comment cards."""
     comments = []
     seen_ids = set()
+
+    # alphaXiv async REST path — PREFERRED when we have the group UUID
+    if group_uuid and 'alphaxiv.org' in paper_host:
+        api_url = f'https://api.alphaxiv.org/papers/v3/legacy/{group_uuid}/comments'
+        api_headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': paper_host,
+            'Referer': f'{paper_host}/',
+        }
+        try:
+            r = _retry_session.get(api_url, headers=api_headers, timeout=10, allow_redirects=False)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    for c in data:
+                        _add_comment_from_dict(c, comments, seen_ids)
+                elif isinstance(data, dict):
+                    arr = data.get('comments') or data.get('results') or []
+                    if isinstance(arr, list):
+                        for c in arr:
+                            _add_comment_from_dict(c, comments, seen_ids)
+        except Exception:
+            pass
+        # If the REST endpoint returned usable comments, skip the noisy fallbacks below
+        # (for alphaxiv the DOM often only contains the empty discussion header)
+        if comments:
+            return comments
+
     # JSON embedded comments search
     for pat in [r'"comments"\s*:\s*(\[.*?\])', r'"discussions"\s*:\s*(\[.*?\])', r'"replies"\s*:\s*(\[.*?\])']:
         for m in re.finditer(pat, html_raw, re.DOTALL):
@@ -585,7 +640,13 @@ def _extract_comments(soup, html_raw):
                         _add_comment_from_dict(c, comments, seen_ids)
             except Exception:
                 pass
-    # DOM-based fallback
+    # DOM-based fallback — apply a simple content filter to skip empty headers/wrappers
+    noise_substrings = (
+        'Leave a comment', 'Sign in', 'Post a comment', 'Loading comment',
+        'No comments yet', 'Be the first to comment', 'Reply (without quoting)',
+        'Report comment', 'Endorse', 'Comment is pending', 'Delete comment',
+        'Edit comment', 'Load more comments', 'Show more comments',
+    )
     for sel in [
         '[class*="comment"]', '[class*="discussion"]', '[id*="comment"]',
         'article.comment', 'div.comment', 'li.comment'
@@ -593,6 +654,8 @@ def _extract_comments(soup, html_raw):
         for el in soup.select(sel):
             txt = el.get_text('\n', strip=True)
             if not txt or len(txt) < 15:
+                continue
+            if any(ns.lower() in txt.lower() for ns in noise_substrings) and len(txt) < 120:
                 continue
             author_el = el.select_one('[class*="author"], [class*="user"], [class*="name"]')
             author = author_el.get_text(strip=True) if author_el else ''
@@ -611,6 +674,7 @@ def _extract_comments(soup, html_raw):
                 'content': txt,
                 'published_at': ts,
             })
+
     return comments
 
 
@@ -620,24 +684,34 @@ def _add_comment_from_dict(c, comments, seen_ids):
     content = c.get('body') or c.get('content') or c.get('text') or c.get('message') or ''
     if not content or len(str(content)) < 10:
         return
-    cid = str(c.get('id') or c.get('comment_id') or hashlib.md5(str(content).encode('utf-8')).hexdigest()[:12])
+    cid = str(c.get('id') or c.get('comment_id') or c.get('universalId') or hashlib.md5(str(content).encode('utf-8')).hexdigest()[:12])
     if cid in seen_ids:
         return
     seen_ids.add(cid)
     author = ''
     a = c.get('author') or c.get('user') or c.get('creator')
     if isinstance(a, dict):
-        author = a.get('name') or a.get('username') or ''
+        author = (
+            a.get('realName') or a.get('name') or a.get('username')
+            or a.get('displayName') or a.get('fullName') or a.get('handle') or ''
+        )
     elif isinstance(a, str):
         author = a
-    ts = c.get('created_at') or c.get('published_at') or c.get('timestamp') or c.get('date') or ''
+    if not author:
+        aname = c.get('authorName') or c.get('userName') or c.get('creatorName') or ''
+        if aname:
+            author = aname
+    ts = (
+        c.get('created_at') or c.get('published_at') or c.get('timestamp')
+        or c.get('date') or c.get('createdAt') or c.get('publishedAt') or ''
+    )
     comments.append({
         'id': cid,
         'author': str(author),
         'content': str(content),
         'published_at': str(ts),
     })
-    for ch_key in ('replies', 'children', 'comments'):
+    for ch_key in ('replies', 'children', 'comments', 'responses'):
         children = c.get(ch_key)
         if isinstance(children, list):
             for ch in children:
@@ -1586,6 +1660,8 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
         tasks.append((f"COMMENT::{cr['id']}", cr['content_en']))
 
     print(f"[INFO] [5/7] 调用大模型翻译：共 {len(tasks)} 项待翻译 (model={translator.model}) …")
+    by_paper_updates = {}
+    comment_updates = []
     if tasks:
         route = 'DashScope 原生 SDK' if translator.model == 'qwen-plus' else 'OpenAI 兼容接口'
         overview_cnt = sum(1 for (k, _) in tasks if k.startswith('OVERVIEW'))
@@ -1594,8 +1670,6 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
         got = len(translated_map)
         print(f"[INFO]   翻译返回：{got}/{len(tasks)} 条结果")
         # Apply translations
-        by_paper_updates = {}
-        comment_updates = []
         for key, zh in translated_map.items():
             if not zh:
                 continue
