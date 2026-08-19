@@ -558,6 +558,7 @@ const state = {
   currentPaperId: null,
   currentCommentId: null,
   currentRunId: null,
+  scrollPos: { papers: 0, comments: 0, runs: 0 },
 };
 
 async function apiGet(url) {
@@ -645,7 +646,20 @@ async function renderDashboard() {
 window.goPapers = (opts) => {
   Object.assign(state.papers, opts, { page: 0 });
   state.currentPaperId = null;
+  state.scrollPos.papers = 0;
   switchTab('papers');
+};
+window.backToPapers = () => {
+  state.currentPaperId = null;
+  loadTab();
+};
+window.backToComments = () => {
+  state.currentCommentId = null;
+  loadTab();
+};
+window.backToRuns = () => {
+  state.currentRunId = null;
+  loadTab();
 };
 
 // ============================================================
@@ -748,20 +762,22 @@ async function renderPapers() {
       </table>
     `;
   }
-  const pager = paginate(data.page, data.total_pages, (p) => { state.papers.page = p; renderPapers(); });
+  const pager = paginate(data.page, data.total_pages, (p) => { state.papers.page = p; state.scrollPos.papers = 0; renderPapers(); });
   app.innerHTML = `<div class="card">${breadcrumbs}${toolbar}${rowsHtml}${pager}</div>`;
 
   $('#searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
   $('#btnSearch').addEventListener('click', doSearch);
   $('#btnReset').addEventListener('click', () => {
     state.papers = { page: 0, sort: 'likes', search: '', filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0, filter_exclude_disliked: 0 };
+    state.scrollPos.papers = 0;
     renderPapers();
   });
-  $('#sortSel').addEventListener('change', (e) => { state.papers.sort = e.target.value; state.papers.page = 0; renderPapers(); });
+  $('#sortSel').addEventListener('change', (e) => { state.papers.sort = e.target.value; state.papers.page = 0; state.scrollPos.papers = 0; renderPapers(); });
   for (const [id, key] of [['fUnread','filter_unread'],['fFav','filter_fav'],['fDis','filter_disliked'],['fSha','filter_shared'],['fExDis','filter_exclude_disliked']]) {
-    $(`#${id}`).addEventListener('change', (e) => { state.papers[key] = e.target.checked ? 1 : 0; state.papers.page = 0; renderPapers(); });
+    $(`#${id}`).addEventListener('change', (e) => { state.papers[key] = e.target.checked ? 1 : 0; state.papers.page = 0; state.scrollPos.papers = 0; renderPapers(); });
   }
   $$('.paper-title').forEach(el => el.addEventListener('click', () => {
+    state.scrollPos.papers = window.scrollY || document.documentElement.scrollTop || 0;
     state.currentPaperId = el.dataset.pid; loadTab();
   }));
   $$('.action-btn[data-mark]').forEach(el => el.addEventListener('click', async (ev) => {
@@ -787,10 +803,19 @@ async function renderPapers() {
       }
     }
   }));
+  const restoreScroll = state.scrollPos.papers > 0;
+  if (restoreScroll) {
+    const pos = state.scrollPos.papers;
+    state.scrollPos.papers = 0;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => window.scrollTo({ top: pos, behavior: 'auto' }));
+    });
+  }
 }
 function doSearch() {
   state.papers.search = $('#searchInput').value.trim();
   state.papers.page = 0;
+  state.scrollPos.papers = 0;
   renderPapers();
 }
 
@@ -807,8 +832,14 @@ async function renderPaperDetail(pid) {
   const alphaurl = p.url || `https://www.alphaxiv.org/abs/${p.paper_id}`;
 
   const crumbs = `<div class="breadcrumbs">
-    <a onclick="state.currentPaperId=null; loadTab();">📄 论文列表</a>
+    <a onclick="window.backToPapers();">📄 返回论文列表</a>
     › 详情 · <code>${esc(p.paper_id)}</code>
+  </div>`;
+
+  const backBtn = `<div style="margin-bottom:14px;">
+    <button class="action-btn on" style="background:#2563eb;color:#fff;border-color:#2563eb;padding:8px 18px;font-size:14px;" onclick="window.backToPapers();">
+      ← 返回论文列表
+    </button>
   </div>`;
 
   const markBar = `
@@ -873,7 +904,7 @@ async function renderPaperDetail(pid) {
     </div>
   `;
 
-  app.innerHTML = `<div class="card">${crumbs}${markBar}
+  app.innerHTML = `<div class="card">${crumbs}${backBtn}${markBar}
     ${titleSection}
     <div class="detail-section"><h3>🏷 元数据</h3>${metaGrid}</div>
     ${abstractSection}
@@ -930,7 +961,7 @@ async function renderComments() {
   </div>`;
   const toolbar = state.comments.paper_id ? '' : `
     <div class="toolbar">
-      <button onclick="state.comments.paper_id=null; state.comments.page=0; renderComments();">全部评论</button>
+      <button onclick="state.comments.paper_id=null; state.comments.page=0; state.scrollPos.comments=0; renderComments();">全部评论</button>
     </div>
   `;
   let body = '';
@@ -951,15 +982,24 @@ async function renderComments() {
       </div>
     `).join('');
   }
-  const pager = paginate(data.page, data.total_pages, (p) => { state.comments.page = p; renderComments(); });
+  const pager = paginate(data.page, data.total_pages, (p) => { state.comments.page = p; state.scrollPos.comments = 0; renderComments(); });
   app.innerHTML = `<div class="card">${crumbs}${toolbar}${body}${pager}</div>`;
   $$('.comment-card').forEach(el => el.addEventListener('click', () => {
+    state.scrollPos.comments = window.scrollY || document.documentElement.scrollTop || 0;
     state.currentCommentId = el.dataset.cid; loadTab();
   }));
   $$('[data-gopaper]').forEach(el => el.addEventListener('click', (e) => {
     e.stopPropagation();
     state.tab = 'papers'; state.currentPaperId = el.dataset.gopaper; loadTab();
   }));
+  const restoreScroll = state.scrollPos.comments > 0;
+  if (restoreScroll) {
+    const pos = state.scrollPos.comments;
+    state.scrollPos.comments = 0;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => window.scrollTo({ top: pos, behavior: 'auto' }));
+    });
+  }
 }
 
 async function renderCommentDetail(cid) {
@@ -968,9 +1008,14 @@ async function renderCommentDetail(cid) {
   const c = await apiGet(`/api/comment/${cid}`);
   if (!c) { app.innerHTML = `<div class="empty">未找到评论 #${esc(cid)}</div>`; return; }
   const crumbs = `<div class="breadcrumbs">
-    <a onclick="state.currentCommentId=null; loadTab();">💬 返回评论列表</a> › #${c.id}
+    <a onclick="window.backToComments();">💬 返回评论列表</a> › #${c.id}
   </div>`;
-  app.innerHTML = `<div class="card">${crumbs}
+  const backBtn = `<div style="margin-bottom:14px;">
+    <button class="action-btn on" style="background:#2563eb;color:#fff;border-color:#2563eb;padding:8px 18px;font-size:14px;" onclick="window.backToComments();">
+      ← 返回评论列表
+    </button>
+  </div>`;
+  app.innerHTML = `<div class="card">${crumbs}${backBtn}
     <div class="detail-section"><h3>💬 评论详情</h3>
       <div class="kv-grid">
         <div class="k">评论 ID</div><div class="v">${c.id}</div>
@@ -1018,11 +1063,20 @@ async function renderRuns() {
       `).join('')}</tbody>
     </table>`;
   }
-  const pager = paginate(data.page, data.total_pages, (p) => { state.runs.page = p; renderRuns(); });
+  const pager = paginate(data.page, data.total_pages, (p) => { state.runs.page = p; state.scrollPos.runs = 0; renderRuns(); });
   app.innerHTML = `<div class="card">${crumbs}${body}${pager}</div>`;
   $$('[data-rid]').forEach(b => b.addEventListener('click', () => {
+    state.scrollPos.runs = window.scrollY || document.documentElement.scrollTop || 0;
     state.currentRunId = b.dataset.rid; loadTab();
   }));
+  const restoreScroll = state.scrollPos.runs > 0;
+  if (restoreScroll) {
+    const pos = state.scrollPos.runs;
+    state.scrollPos.runs = 0;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => window.scrollTo({ top: pos, behavior: 'auto' }));
+    });
+  }
 }
 
 async function renderRunDetail(rid) {
@@ -1031,7 +1085,12 @@ async function renderRunDetail(rid) {
   const r = await apiGet(`/api/run/${rid}`);
   if (!r) { app.innerHTML = `<div class="empty">未找到运行记录 #${esc(rid)}</div>`; return; }
   const crumbs = `<div class="breadcrumbs">
-    <a onclick="state.currentRunId=null; loadTab();">🏃 返回运行列表</a> › #${r.id}
+    <a onclick="window.backToRuns();">🏃 返回运行列表</a> › #${r.id}
+  </div>`;
+  const backBtn = `<div style="margin-bottom:14px;">
+    <button class="action-btn on" style="background:#2563eb;color:#fff;border-color:#2563eb;padding:8px 18px;font-size:14px;" onclick="window.backToRuns();">
+      ← 返回运行列表
+    </button>
   </div>`;
   const view = state.runDetail.view || 'summary';
   const newPapersList = r.new_papers_detail && r.new_papers_detail.length ? r.new_papers_detail.map(p => `
@@ -1091,7 +1150,7 @@ async function renderRunDetail(rid) {
     rank: rankHtml,
   };
 
-  app.innerHTML = `<div class="card">${crumbs}
+  app.innerHTML = `<div class="card">${crumbs}${backBtn}
     <div class="detail-section"><h3>🏃 运行记录 #${r.id}</h3>
       <div class="run-action-group">
         <button class="${view==='summary'?'active':''}" data-view="summary">📋 摘要</button>
