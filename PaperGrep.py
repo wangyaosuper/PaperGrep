@@ -97,7 +97,8 @@ def init_db():
         is_read INTEGER DEFAULT 0,
         is_favorite INTEGER DEFAULT 0,
         is_disliked INTEGER DEFAULT 0,
-        is_shared INTEGER DEFAULT 0
+        is_shared INTEGER DEFAULT 0,
+        categories_json TEXT DEFAULT '[]'
     );
 
     CREATE TABLE IF NOT EXISTS comments (
@@ -145,6 +146,11 @@ def init_db():
             conn.commit()
         except Exception:
             pass
+    try:
+        c.execute("ALTER TABLE papers ADD COLUMN categories_json TEXT DEFAULT '[]'")
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     return conn
 
@@ -1444,10 +1450,13 @@ def _clip(s, n):
     return (s[:n] + '…') if len(s) > n else s
 
 
-def sync_papers(conn, fetched_papers, translator, fetch_details=True):
+def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=None):
     """Insert/update papers, detect changes, trigger translations when needed.
+    Categories are additive: if `category` is provided, it is merged (union) into existing categories.
     Returns (new_paper_ids, updated_papers_info, new_comments_info, likes_ranking_before, likes_ranking_after, translation_updates, comment_translations)"""
     print(f"[INFO] [4/7] 同步 {len(fetched_papers)} 篇论文到数据库 …")
+    if category:
+        print(f"[INFO]   本次标记类别：{category}（累加到已有类别）")
     now = datetime.now().isoformat(timespec='seconds')
     c = conn.cursor()
 
@@ -1502,18 +1511,19 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
         if row is None:
             abstract_full = abstract_full_incoming
             ai_overview = ai_overview_incoming
+            new_categories = [category] if category else []
             c.execute("""
                 INSERT INTO papers (paper_id, url, title_en, abstract_en, ai_overview_en, authors_json,
                     published_date, modified_date, likes, views, comment_count,
                     title_hash, abstract_hash, ai_overview_hash, translated_fields,
-                    first_seen, last_updated)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    first_seen, last_updated, categories_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 pid, p['url'], title, abstract_full, ai_overview, authors_json,
                 p['published_date'], p['modified_date'], p['likes'], p['views'],
                 max(cc, 0),
                 new_title_hash, new_abstract_hash, new_ai_overview_hash, '{}',
-                now, now
+                now, now, json.dumps(new_categories, ensure_ascii=False)
             ))
             new_paper_ids.append(pid)
             _sync_comments_for(conn, pid, comments, new_comments, now)
@@ -1580,18 +1590,31 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True):
         if prev['modified_date'] != p['modified_date']:
             changes.append({'field': 'modified_date'})
 
+        prev_categories = []
+        try:
+            prev_categories = json.loads(prev.get('categories_json') or '[]') or []
+        except Exception:
+            prev_categories = []
+        merged_categories = list(prev_categories)
+        if category and category not in merged_categories:
+            merged_categories.append(category)
+            changes.append({'field': 'categories',
+                            'before': prev_categories,
+                            'after': merged_categories})
+        merged_categories_json = json.dumps(merged_categories, ensure_ascii=False)
+
         c.execute("""
             UPDATE papers SET
                 url=?, title_en=?, abstract_en=?, ai_overview_en=?, authors_json=?,
                 published_date=?, modified_date=?, likes=?, views=?, comment_count=?,
                 title_hash=?, abstract_hash=?, ai_overview_hash=?, translated_fields=?,
-                last_updated=?
+                last_updated=?, categories_json=?
             WHERE paper_id=?
         """, (
             p['url'], store_title, store_abstract, store_overview, authors_json,
             p['published_date'], p['modified_date'], p['likes'], p['views'], max(cc, 0),
             store_title_hash, store_abstract_hash, store_overview_hash,
-            json.dumps(translated, ensure_ascii=False), now, pid
+            json.dumps(translated, ensure_ascii=False), now, merged_categories_json, pid
         ))
 
         if changes:
@@ -2275,6 +2298,11 @@ def build_arg_parser():
         prog='PaperGrep.py',
         description='Fetch, persist, translate, and report papers from alphaXiv.org',
     )
+    p.add_argument('--category', type=str, required=True,
+                   choices=['self-driving', 'robot'],
+                   help='Assign a category to papers scraped in this run. '
+                        'Must be exactly "self-driving" or "robot". '
+                        'Categories are additive: a paper can have multiple categories across runs.')
     p.add_argument('--after', type=str, default=None,
                    help='Only include papers published on/after this datetime. '
                         'Formats: YYYY-MM-DD or "YYYY-MM-DD HH:MM"')
@@ -2325,6 +2353,7 @@ def main():
     print(f"  协议：      {args.protocol} (json/xml，可用 --protocol xml 改用 XML 标签分隔模式，避免 JSON 转义格式错误)")
     print(f"  时间范围：  after={args.after or '(无)'}  before={args.before or '(无)'}")
     print(f"  详情页：    {'关闭 (--no-details)' if args.no_details else '开启'}")
+    print(f"  类别：      {args.category or '(无，不标记)'}")
     print("=" * 80)
     print()
 
@@ -2382,6 +2411,11 @@ def main():
     else:
         print(f"[INFO] [3/7] 无时间过滤：保留全部 {before_cnt} 篇论文")
 
+    # Likes filter: drop papers with likes < 3
+    likes_before = len(papers)
+    papers = [p for p in papers if p.get('likes', 0) >= 3]
+    print(f"[INFO] [3.5/7] 点赞过滤（likes >= 3）：保留 {len(papers)}/{likes_before} 篇论文")
+
     if not papers:
         print("[WARN] No papers to process. Exiting.")
         return
@@ -2395,7 +2429,8 @@ def main():
     print(f"[INFO] LLM translator：{route}，可用={translator.available()}，协议={translator.protocol!r}，DEBUG 日志={'开启' if translator.verbose else '关闭'}")
 
     new_ids, updated, new_comments, rank_before, rank_after, trans_updates, comment_trans = sync_papers(
-        conn, papers, translator, fetch_details=(not args.no_details)
+        conn, papers, translator, fetch_details=(not args.no_details),
+        category=args.category,
     )
     build_and_save_report(conn, new_ids, updated, new_comments, rank_before, rank_after,
                           trans_updates, comment_trans, args)

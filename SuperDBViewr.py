@@ -16,6 +16,15 @@ DEFAULT_DB_PATH = os.path.join(DB_DIR, "papergrep.db")
 
 PAGE_SIZE = 50
 
+VALID_CATEGORIES = ["self-driving", "robot"]
+
+
+def _parse_categories_json(s):
+    try:
+        return json.loads(s or '[]') or []
+    except Exception:
+        return []
+
 
 # ============================================================
 # Database helpers
@@ -45,6 +54,11 @@ def _migrate_db(conn):
             conn.commit()
         except Exception:
             pass
+    try:
+        c.execute("ALTER TABLE papers ADD COLUMN categories_json TEXT DEFAULT '[]'")
+        conn.commit()
+    except Exception:
+        pass
 
 
 def row_to_dict(row):
@@ -89,6 +103,15 @@ def api_get_stats(conn):
     shared_count = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM papers WHERE is_read=1")
     read_count = c.fetchone()[0]
+    category_counts = {}
+    for cat in VALID_CATEGORIES:
+        safe_cat = cat.replace("'", "''")
+        c.execute(
+            f"SELECT COUNT(*) FROM papers WHERE EXISTS ("
+            f"SELECT 1 FROM json_each(COALESCE(categories_json,'[]')) "
+            f"WHERE value = '{safe_cat}')"
+        )
+        category_counts[cat] = c.fetchone()[0]
     return {
         "paper_count": paper_count,
         "comment_count": comment_count,
@@ -100,6 +123,8 @@ def api_get_stats(conn):
         "shared_count": shared_count,
         "read_count": read_count,
         "unread_count": max(0, paper_count - read_count),
+        "valid_categories": VALID_CATEGORIES,
+        "category_counts": category_counts,
     }
 
 
@@ -122,6 +147,8 @@ def _parse_filters(query_dict):
     shared = query_dict.get('filter_shared', [None])[0]
     unread = query_dict.get('filter_unread', [None])[0]
     exclude_disl = query_dict.get('filter_exclude_disliked', [None])[0]
+    cat_mode = query_dict.get('filter_cat_mode', ['any'])[0] or 'any'
+    cat_raw = query_dict.get('filter_categories', [''])[0] or ''
     if fav == '1':
         where_parts.append("is_favorite=1")
     if disl == '1':
@@ -132,6 +159,28 @@ def _parse_filters(query_dict):
         where_parts.append("is_read=0")
     if exclude_disl == '1':
         where_parts.append("(is_disliked IS NULL OR is_disliked=0)")
+    cats = [c for c in cat_raw.split(',') if c in VALID_CATEGORIES] if cat_raw else []
+    if cats:
+        cat_where = []
+        safe_cats = {}
+        for c in cats:
+            safe_c = c.replace("'", "''")
+            safe_cats[c] = safe_c
+            cat_where.append(f"json_each_cat.value = '{safe_c}'")
+        if cat_mode == 'any':
+            cat_clause = (
+                f"EXISTS (SELECT 1 FROM json_each(COALESCE(categories_json,'[]')) AS json_each_cat "
+                f"WHERE {' OR '.join(cat_where)})"
+            )
+        else:
+            all_parts = []
+            for c in cats:
+                sc = safe_cats[c]
+                all_parts.append(
+                    f"EXISTS (SELECT 1 FROM json_each(COALESCE(categories_json,'[]')) AS json_each_cat WHERE json_each_cat.value = '{sc}')"
+                )
+            cat_clause = " AND ".join(all_parts)
+        where_parts.append(f"({cat_clause})")
     return where_parts, params
 
 
@@ -170,14 +219,17 @@ def api_list_papers(conn, query_dict):
     c.execute(f"""
         SELECT paper_id, url, title_en, title_zh, likes, views, comment_count,
                published_date, authors_json, first_seen, last_updated,
-               is_read, is_favorite, is_disliked, is_shared
+               is_read, is_favorite, is_disliked, is_shared, categories_json
         FROM papers {where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?
     """, params + [size, offset])
     rows = [row_to_dict(r) for r in c.fetchall()]
     for r in rows:
         r['authors_display'] = format_authors(r.get('authors_json'), 3)
         r['title_display'] = r.get('title_zh') or r.get('title_en') or r.get('paper_id') or ''
+        r['categories'] = _parse_categories_json(r.pop('categories_json', None))
 
+    cat_raw = query_dict.get('filter_categories', [''])[0] or ''
+    cat_mode = query_dict.get('filter_cat_mode', ['any'])[0] or 'any'
     return {
         "papers": rows,
         "total": total,
@@ -187,6 +239,9 @@ def api_list_papers(conn, query_dict):
         "sort_options": {k: v[1] for k, v in SORT_OPTIONS.items()},
         "sort_key": sort_key,
         "search": search,
+        "valid_categories": VALID_CATEGORIES,
+        "filter_categories": [c for c in cat_raw.split(',') if c in VALID_CATEGORIES] if cat_raw else [],
+        "filter_cat_mode": cat_mode,
     }
 
 
@@ -200,6 +255,8 @@ def api_get_paper(conn, paper_id):
         return None
     d = row_to_dict(row)
     d['authors_display'] = format_authors(d.get('authors_json'))
+    d['categories'] = _parse_categories_json(d.pop('categories_json', None))
+    d['valid_categories'] = VALID_CATEGORIES
     try:
         d['translated_fields_obj'] = json.loads(d.get('translated_fields') or '{}')
     except Exception:
@@ -241,6 +298,28 @@ def api_mark_paper(conn, paper_id, payload):
     )
     conn.commit()
     return cur
+
+
+def api_update_paper_categories(conn, paper_id, payload):
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM papers WHERE paper_id=?", (paper_id,))
+    if not c.fetchone():
+        return None
+    cats_raw = payload.get('categories')
+    if not isinstance(cats_raw, list):
+        cats_raw = []
+    seen = set()
+    cats = []
+    for v in cats_raw:
+        if isinstance(v, str) and v in VALID_CATEGORIES and v not in seen:
+            seen.add(v)
+            cats.append(v)
+    c.execute(
+        "UPDATE papers SET categories_json=? WHERE paper_id=?",
+        (json.dumps(cats, ensure_ascii=False), paper_id)
+    )
+    conn.commit()
+    return {'paper_id': paper_id, 'categories': cats, 'valid_categories': VALID_CATEGORIES}
 
 
 def api_list_comments(conn, query_dict):
@@ -475,6 +554,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .badge-dislike { background: #fee2e2; color: #991b1b; }
   .badge-shared { background: #dcfce7; color: #166534; }
   .badge-unread { background: #fce7f3; color: #9d174d; }
+  .badge-cat { background: #ede9fe; color: #5b21b6; cursor: pointer; }
+  .badge-cat:hover { background: #ddd6fe; }
   .paper-title { font-weight: 500; color: #1e40af; cursor: pointer; }
   .paper-title:hover { text-decoration: underline; }
   .paper-title-en { font-size: 12px; color: #6b7280; margin-top: 2px; font-weight: 400; line-height: 1.4; }
@@ -551,7 +632,11 @@ const esc = (s) => (s == null ? '' : String(s)).replace(/[&<>"']/g, c => ({'&':'
 
 const state = {
   tab: 'dashboard',
-  papers: { page: 0, sort: 'likes', search: '', filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0, filter_exclude_disliked: 0 },
+  papers: {
+    page: 0, sort: 'likes', search: '',
+    filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0, filter_exclude_disliked: 0,
+    filter_categories: [], filter_cat_mode: 'any',
+  },
   comments: { page: 0, paper_id: null },
   runs: { page: 0 },
   runDetail: { view: 'summary' },
@@ -608,6 +693,18 @@ async function renderDashboard() {
   const stats = await apiGet('/api/stats');
   const app = $('#app');
   const unreadPct = stats.paper_count ? Math.round((stats.read_count / stats.paper_count) * 100) : 0;
+  const catCounts = stats.category_counts || {};
+  const validCats = stats.valid_categories || [];
+  const catStatBoxes = validCats.map(cat => `
+    <div class="stat-box purple"><div class="num">${catCounts[cat]||0}</div><div class="lbl">🏷 ${esc(cat)}</div></div>
+  `).join('');
+  const catQuickBtns = validCats.length ? `
+      <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:8px;">
+        <span style="font-size:13px;color:#64748b;align-self:center;">类别快速过滤：</span>
+        ${validCats.map(cat => `<button onclick="goPapers({filter_categories:['${esc(cat)}'], filter_cat_mode:'any'})">🏷 ${esc(cat)} (${catCounts[cat]||0})</button>`).join('')}
+        ${validCats.length>1 ? `<button onclick="goPapers({filter_categories:${JSON.stringify(validCats)}, filter_cat_mode:'all'})">🎯 同时属于所有类别</button>` : ''}
+      </div>
+  ` : '';
   app.innerHTML = `
     <div class="card"><h2>📊 数据库总览</h2>
       <div class="stats-grid">
@@ -621,6 +718,7 @@ async function renderDashboard() {
         <div class="stat-box ok"><div class="num">${stats.shared_count}</div><div class="lbl">📤 已分享</div></div>
         <div class="stat-box alt"><div class="num">${stats.read_count}</div><div class="lbl">✅ 已读 (${unreadPct}%)</div></div>
         <div class="stat-box bad"><div class="num">${stats.unread_count}</div><div class="lbl">📖 未读</div></div>
+        ${catStatBoxes}
       </div>
     </div>
     <div class="card"><h2>🚀 快速入口</h2>
@@ -631,6 +729,7 @@ async function renderDashboard() {
         <button onclick="goPapers({filter_shared:1})">📤 已分享</button>
         <button onclick="goPapers({sort:'first_seen'})">🆕 最新入库</button>
         <button onclick="goPapers({sort:'likes'})">🔥 热门排序</button>
+        ${catQuickBtns}
       </div>
     </div>
     <div class="card"><h2>📝 使用说明</h2>
@@ -639,6 +738,7 @@ async function renderDashboard() {
         <li>在论文详情或列表中可以快速标记：⭐收藏 / 👎不喜欢 / 📤已分享。收藏与不喜欢互斥。</li>
         <li>论文列表支持关键词搜索（匹配标题/摘要/paper_id），以及多种排序与筛选。</li>
         <li>运行记录中可以查看每次抓取新增/更新论文、评论以及点赞排名变化对比。</li>
+        <li>类别筛选支持多选，并可切换「任一匹配 (any)」或「全部同时拥有 (all)」模式。</li>
       </ul>
     </div>
   `;
@@ -672,6 +772,10 @@ function markBadges(p) {
   if (p.is_favorite) parts.push(`<span class="badge badge-fav">⭐收藏</span>`);
   if (p.is_disliked) parts.push(`<span class="badge badge-dislike">👎不喜欢</span>`);
   if (p.is_shared) parts.push(`<span class="badge badge-shared">📤已分享</span>`);
+  const cats = Array.isArray(p.categories) ? p.categories : [];
+  for (const c of cats) {
+    parts.push(`<span class="badge badge-cat" data-cat="${esc(c)}">🏷 ${esc(c)}</span>`);
+  }
   return parts.join(' ');
 }
 
@@ -688,6 +792,7 @@ function quickMarkButtons(p) {
 
 async function renderPapers() {
   const app = $('#app');
+  const catList = Array.isArray(state.papers.filter_categories) ? state.papers.filter_categories : [];
   const qp = new URLSearchParams({
     page: state.papers.page, size: ${PAGE_SIZE}, sort: state.papers.sort,
     search: state.papers.search,
@@ -696,10 +801,28 @@ async function renderPapers() {
     filter_shared: state.papers.filter_shared,
     filter_unread: state.papers.filter_unread,
     filter_exclude_disliked: state.papers.filter_exclude_disliked,
+    filter_categories: catList.join(','),
+    filter_cat_mode: state.papers.filter_cat_mode || 'any',
   });
   const data = await apiGet('/api/papers?' + qp);
   const sortOpts = data.sort_options || {};
-  const breadcrumbs = `<div class="breadcrumbs">📄 论文列表 ${data.search ? '· 搜索: ' + esc(data.search) : ''} ${data.total > 0 ? `· 共 ${data.total} 篇` : ''}</div>`;
+  const validCats = data.valid_categories || [];
+  const selCats = Array.isArray(data.filter_categories) ? data.filter_categories : [];
+  const catMode = data.filter_cat_mode || 'any';
+  const filterCrumbs = selCats.length ? ` · 类别[${catMode.toUpperCase()}]: ${selCats.join(' + ')}` : '';
+  const breadcrumbs = `<div class="breadcrumbs">📄 论文列表 ${data.search ? '· 搜索: ' + esc(data.search) : ''} ${filterCrumbs} ${data.total > 0 ? `· 共 ${data.total} 篇` : ''}</div>`;
+  const catCheckboxes = validCats.map(cat => {
+    const on = selCats.includes(cat);
+    return `<label class="filter-check ${on?'on':''}" title="类别筛选">
+      <input type="checkbox" class="cat-chk" data-cat="${esc(cat)}" ${on?'checked':''}/> 🏷 ${esc(cat)}
+    </label>`;
+  }).join('');
+  const catModeSel = `
+    <select id="catModeSel" title="类别匹配模式">
+      <option value="any" ${catMode==='any'?'selected':''}>类别: 任一匹配 (OR)</option>
+      <option value="all" ${catMode==='all'?'selected':''}>类别: 全部同时拥有 (AND)</option>
+    </select>
+  `;
   const toolbar = `
     <div class="toolbar">
       <input type="text" id="searchInput" placeholder="🔍 搜索标题/摘要/ID ..." value="${esc(data.search)}" />
@@ -721,6 +844,8 @@ async function renderPapers() {
       <label class="filter-check ${state.papers.filter_exclude_disliked?'on':''}">
         <input type="checkbox" id="fExDis" ${state.papers.filter_exclude_disliked?'checked':''}/> 🚫 排除不喜欢
       </label>
+      ${catModeSel}
+      ${catCheckboxes}
       <button id="btnSearch">搜索</button>
       <button id="btnReset">重置</button>
     </div>
@@ -768,7 +893,11 @@ async function renderPapers() {
   $('#searchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
   $('#btnSearch').addEventListener('click', doSearch);
   $('#btnReset').addEventListener('click', () => {
-    state.papers = { page: 0, sort: 'likes', search: '', filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0, filter_exclude_disliked: 0 };
+    state.papers = {
+      page: 0, sort: 'likes', search: '',
+      filter_fav: 0, filter_disliked: 0, filter_shared: 0, filter_unread: 0, filter_exclude_disliked: 0,
+      filter_categories: [], filter_cat_mode: 'any',
+    };
     state.scrollPos.papers = 0;
     renderPapers();
   });
@@ -776,6 +905,27 @@ async function renderPapers() {
   for (const [id, key] of [['fUnread','filter_unread'],['fFav','filter_fav'],['fDis','filter_disliked'],['fSha','filter_shared'],['fExDis','filter_exclude_disliked']]) {
     $(`#${id}`).addEventListener('change', (e) => { state.papers[key] = e.target.checked ? 1 : 0; state.papers.page = 0; state.scrollPos.papers = 0; renderPapers(); });
   }
+  if ($('#catModeSel')) {
+    $('#catModeSel').addEventListener('change', (e) => { state.papers.filter_cat_mode = e.target.value; state.papers.page = 0; state.scrollPos.papers = 0; renderPapers(); });
+  }
+  $$('.cat-chk').forEach(el => el.addEventListener('change', (e) => {
+    const cat = el.dataset.cat;
+    const cur = new Set(state.papers.filter_categories || []);
+    if (el.checked) cur.add(cat); else cur.delete(cat);
+    state.papers.filter_categories = [...cur];
+    state.papers.page = 0;
+    state.scrollPos.papers = 0;
+    renderPapers();
+  }));
+  $$('.badge-cat[data-cat]').forEach(el => el.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const cat = el.dataset.cat;
+    state.papers.filter_categories = [cat];
+    state.papers.filter_cat_mode = 'any';
+    state.papers.page = 0;
+    state.scrollPos.papers = 0;
+    renderPapers();
+  }));
   $$('.paper-title').forEach(el => el.addEventListener('click', () => {
     state.scrollPos.papers = window.scrollY || document.documentElement.scrollTop || 0;
     state.currentPaperId = el.dataset.pid; loadTab();
@@ -854,10 +1004,32 @@ async function renderPaperDetail(pid) {
     </div>
   `;
 
+  const cats = Array.isArray(p.categories) ? p.categories : [];
+  const catHtml = cats.length
+    ? cats.map(c => `<span class="badge badge-cat" style="cursor:pointer;" onclick="window.goPapers({filter_categories:['${esc(c)}'], filter_cat_mode:'any'});">🏷 ${esc(c)}</span>`).join(' ')
+    : '<span style="color:#94a3b8;">(未归类)</span>';
+
+  const validCats = Array.isArray(p.valid_categories) ? p.valid_categories : [];
+  const catEditSection = validCats.length ? `
+    <div class="detail-section">
+      <h3>🏷 类别管理</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        ${validCats.map(cat => {
+          const on = cats.includes(cat);
+          return `<label class="filter-check ${on?'on':''}">
+            <input type="checkbox" class="cat-edit-chk" data-cat="${esc(cat)}" ${on?'checked':''}/> 🏷 ${esc(cat)}
+          </label>`;
+        }).join('')}
+        <span style="font-size:12px;color:#64748b;margin-left:8px;">勾选 / 取消后自动保存</span>
+      </div>
+    </div>
+  ` : '';
+
   const metaGrid = `
     <div class="kv-grid">
       <div class="k">Paper ID</div><div class="v"><code>${esc(p.paper_id)}</code></div>
       <div class="k">作者</div><div class="v">${esc(p.authors_display || 'N/A')}</div>
+      <div class="k">类别</div><div class="v" id="catCell">${catHtml}</div>
       <div class="k">发布日期</div><div class="v">${esc(p.published_date || 'N/A')}</div>
       <div class="k">修改日期</div><div class="v">${esc(p.modified_date || 'N/A')}</div>
       <div class="k">首次入库</div><div class="v">${esc(p.first_seen || 'N/A')}</div>
@@ -907,6 +1079,7 @@ async function renderPaperDetail(pid) {
   app.innerHTML = `<div class="card">${crumbs}${backBtn}${markBar}
     ${titleSection}
     <div class="detail-section"><h3>🏷 元数据</h3>${metaGrid}</div>
+    ${catEditSection}
     ${abstractSection}
     ${overviewSection}
     <div class="detail-section"><h3>🔗 哈希 / 翻译状态</h3>
@@ -918,6 +1091,40 @@ async function renderPaperDetail(pid) {
       <button class="action-btn ok on" id="btnViewComments">查看该论文的评论 →</button>
     </div>
   </div>`;
+
+  const refreshCatCell = () => {
+    const cell = $('#catCell');
+    if (!cell) return;
+    cell.innerHTML = cats.length
+      ? cats.map(c => `<span class="badge badge-cat" style="cursor:pointer;" onclick="window.goPapers({filter_categories:['${esc(c)}'], filter_cat_mode:'any'});">🏷 ${esc(c)}</span>`).join(' ')
+      : '<span style="color:#94a3b8;">(未归类)</span>';
+  };
+  $$('.cat-edit-chk').forEach(el => el.addEventListener('change', async () => {
+    const cat = el.dataset.cat;
+    const cur = new Set(cats);
+    if (el.checked) cur.add(cat); else cur.delete(cat);
+    const newCats = [...cur];
+    try {
+      const res = await apiPost(`/api/paper/${encodeURIComponent(pid)}/categories`, { categories: newCats });
+      if (res && Array.isArray(res.categories)) {
+        cats.length = 0;
+        cats.push(...res.categories);
+        $$('.cat-edit-chk').forEach(c => {
+          const on = cats.includes(c.dataset.cat);
+          c.checked = on;
+          const lbl = c.closest('.filter-check');
+          if (lbl) lbl.classList.toggle('on', on);
+        });
+        refreshCatCell();
+      }
+    } catch (e) {
+      // 还原勾选状态
+      el.checked = !el.checked;
+      const lbl = el.closest('.filter-check');
+      if (lbl) lbl.classList.toggle('on', el.checked);
+      alert('保存类别失败: ' + (e && e.message ? e.message : e));
+    }
+  }));
 
   const doMark = async (mark) => {
     const el = mark === 'favorite' ? $('#btnFav') : mark === 'disliked' ? $('#btnDis') : $('#btnSha');
@@ -1339,6 +1546,13 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 pid = urllib.parse.unquote(m.group(1))
                 res = api_mark_paper(conn, pid, payload)
+                if res is None:
+                    return self._send_json({'error': 'not found'}, 404)
+                return self._send_json(res)
+            m = re.match(r'^/api/paper/([^/]+)/categories$', path)
+            if m:
+                pid = urllib.parse.unquote(m.group(1))
+                res = api_update_paper_categories(conn, pid, payload)
                 if res is None:
                     return self._send_json({'error': 'not found'}, 404)
                 return self._send_json(res)
