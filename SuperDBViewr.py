@@ -7,6 +7,7 @@ import json
 import sqlite3
 import argparse
 import urllib.parse
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import webbrowser
 
@@ -320,6 +321,54 @@ def api_update_paper_categories(conn, paper_id, payload):
     )
     conn.commit()
     return {'paper_id': paper_id, 'categories': cats, 'valid_categories': VALID_CATEGORIES}
+
+
+def api_clear_ai_overview_zh(conn, paper_id):
+    c = conn.cursor()
+    c.execute("SELECT translated_fields FROM papers WHERE paper_id=?", (paper_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    try:
+        translated = json.loads(row[0] or '{}') or {}
+    except Exception:
+        translated = {}
+    translated.pop('ai_overview_zh', None)
+    c.execute(
+        "UPDATE papers SET ai_overview_zh=NULL, ai_overview_summary_zh=NULL, translated_fields=?, last_updated=? WHERE paper_id=?",
+        (json.dumps(translated, ensure_ascii=False), datetime.now().isoformat(timespec='seconds'), paper_id)
+    )
+    conn.commit()
+    return {'paper_id': paper_id, 'cleared': True}
+
+
+def api_update_ai_overview_zh(conn, paper_id, payload):
+    c = conn.cursor()
+    c.execute("SELECT translated_fields FROM papers WHERE paper_id=?", (paper_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    new_content = payload.get('ai_overview_zh')
+    if not isinstance(new_content, str):
+        new_content = None
+    if new_content is not None:
+        new_content = new_content.strip()
+        if not new_content:
+            new_content = None
+    try:
+        translated = json.loads(row[0] or '{}') or {}
+    except Exception:
+        translated = {}
+    if new_content:
+        translated['ai_overview_zh'] = True
+    else:
+        translated.pop('ai_overview_zh', None)
+    c.execute(
+        "UPDATE papers SET ai_overview_zh=?, ai_overview_summary_zh=?, translated_fields=?, last_updated=? WHERE paper_id=?",
+        (new_content, new_content, json.dumps(translated, ensure_ascii=False), datetime.now().isoformat(timespec='seconds'), paper_id)
+    )
+    conn.commit()
+    return {'paper_id': paper_id, 'ai_overview_zh': new_content, 'updated': True}
 
 
 def api_list_comments(conn, query_dict):
@@ -1054,12 +1103,45 @@ async function renderPaperDetail(pid) {
     </div>
   ` : '';
 
-  const overviewSection = (p.ai_overview_zh || p.ai_overview_en) ? `
+  const zhOverviewExists = !!(p.ai_overview_zh && p.ai_overview_zh.trim());
+  const overviewSection = `
     <div class="detail-section"><h3>🤖 AI 概述</h3>
-      ${p.ai_overview_zh ? `<h4 style="margin:6px 0 4px; font-size:13px; color:#64748b;">中文概述（约 ${p.ai_overview_zh.length} 字）</h4><div class="content-block">${esc(p.ai_overview_zh)}</div>` : ''}
+      ${zhOverviewExists ? `
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+          <h4 style="margin:0; font-size:13px; color:#64748b;">中文概述（约 ${p.ai_overview_zh.length} 字）</h4>
+          <div style="margin-left:auto;display:flex;gap:6px;">
+            <button class="action-btn bad" id="btnClearOverviewZh" title="清除当前中文概述，下次 PaperGrep --refill 时会重新生成">🗑 清除中文概述</button>
+            <button class="action-btn ok" id="btnEditOverviewZh" title="手动修改/补充中文概述内容">✏️ 编辑中文概述</button>
+          </div>
+        </div>
+        <div id="overviewZhView"><div class="content-block">${esc(p.ai_overview_zh)}</div></div>
+        <div id="overviewZhEdit" style="display:none;">
+          <textarea id="overviewZhTextarea" style="width:100%;min-height:240px;padding:12px 14px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;line-height:1.7;font-family:inherit;resize:vertical;">${esc(p.ai_overview_zh)}</textarea>
+          <div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end;">
+            <button class="action-btn" id="btnCancelEditOverviewZh">取消</button>
+            <button class="action-btn ok on" id="btnSaveOverviewZh" style="background:#059669;color:#fff;border-color:#059669;">💾 保存修改</button>
+          </div>
+        </div>
+      ` : `
+        <div style="padding:12px 14px;background:#fff7ed;border:1px solid #fed7aa;border-radius:6px;font-size:14px;color:#92400e;">
+          ⚠️ 暂无中文 AI 概述。您可以：<br/>
+          1) 运行 <code>PaperGrep.py --refill</code> 自动从 alphaxiv.org 获取信息并调用大模型生成<br/>
+          2) 点击下方按钮手动输入/粘贴概述内容：
+          <div style="margin-top:10px;">
+            <button class="action-btn ok" id="btnEditOverviewZh" title="手动添加中文概述内容">✏️ 添加中文概述</button>
+          </div>
+        </div>
+        <div id="overviewZhEdit" style="display:none;margin-top:10px;">
+          <textarea id="overviewZhTextarea" style="width:100%;min-height:240px;padding:12px 14px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;line-height:1.7;font-family:inherit;resize:vertical;" placeholder="在此输入中文 AI 概述内容..."></textarea>
+          <div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end;">
+            <button class="action-btn" id="btnCancelEditOverviewZh">取消</button>
+            <button class="action-btn ok on" id="btnSaveOverviewZh" style="background:#059669;color:#fff;border-color:#059669;">💾 保存</button>
+          </div>
+        </div>
+      `}
       ${p.ai_overview_en ? `<h4 style="margin:10px 0 4px; font-size:13px; color:#64748b;">English Overview</h4><div class="content-block">${esc(p.ai_overview_en)}</div>` : ''}
     </div>
-  ` : '';
+  `;
 
   const hashes = `
     <div class="kv-grid" style="font-size:12px;">
@@ -1088,7 +1170,7 @@ async function renderPaperDetail(pid) {
       ${trans}
     </div>
     <div class="detail-section"><h3>💬 相关评论</h3>
-      <button class="action-btn ok on" id="btnViewComments">查看该论文的评论 →</button>
+      <button class="action-btn ok on" id="btnViewComments">查看该论文的评论 (${p.comment_count||0} 条) →</button>
     </div>
   </div>`;
 
@@ -1151,6 +1233,71 @@ async function renderPaperDetail(pid) {
     state.currentCommentId = null;
     loadTab();
   };
+
+  const enterEditMode = () => {
+    const viewEl = document.getElementById('overviewZhView');
+    const editEl = document.getElementById('overviewZhEdit');
+    if (viewEl) viewEl.style.display = 'none';
+    if (editEl) editEl.style.display = 'block';
+    const ta = document.getElementById('overviewZhTextarea');
+    if (ta) { ta.focus(); ta.scrollTop = 0; }
+  };
+  const exitEditMode = () => {
+    const viewEl = document.getElementById('overviewZhView');
+    const editEl = document.getElementById('overviewZhEdit');
+    if (viewEl) viewEl.style.display = 'block';
+    if (editEl) editEl.style.display = 'none';
+  };
+  const btnClear = document.getElementById('btnClearOverviewZh');
+  if (btnClear) {
+    btnClear.onclick = async () => {
+      if (!confirm('确定要清除这篇论文的中文 AI 概述吗？清除后可通过 PaperGrep.py --refill 重新生成。')) return;
+      try {
+        btnClear.disabled = true;
+        btnClear.textContent = '清除中…';
+        const res = await apiPost(`/api/paper/${encodeURIComponent(pid)}/ai_overview_zh/clear`, {});
+        if (res && res.cleared) {
+          alert('✅ 中文 AI 概述已清除！下次运行 PaperGrep.py --refill 时会重新生成。');
+          loadTab();
+        }
+      } catch (e) {
+        alert('清除失败: ' + (e && e.message ? e.message : e));
+        btnClear.disabled = false;
+        btnClear.textContent = '🗑 清除中文概述';
+      }
+    };
+  }
+  const btnEdit = document.getElementById('btnEditOverviewZh');
+  if (btnEdit) {
+    btnEdit.onclick = enterEditMode;
+  }
+  const btnCancelEdit = document.getElementById('btnCancelEditOverviewZh');
+  if (btnCancelEdit) {
+    btnCancelEdit.onclick = exitEditMode;
+  }
+  const btnSaveEdit = document.getElementById('btnSaveOverviewZh');
+  if (btnSaveEdit) {
+    btnSaveEdit.onclick = async () => {
+      const ta = document.getElementById('overviewZhTextarea');
+      const val = ta ? ta.value : '';
+      if (!val || !val.trim()) {
+        if (!confirm('内容为空，保存会清除现有概述，是否继续？')) return;
+      }
+      try {
+        btnSaveEdit.disabled = true;
+        btnSaveEdit.textContent = '保存中…';
+        const res = await apiPost(`/api/paper/${encodeURIComponent(pid)}/ai_overview_zh/update`, { ai_overview_zh: val });
+        if (res && res.updated) {
+          alert('✅ 保存成功！');
+          loadTab();
+        }
+      } catch (e) {
+        alert('保存失败: ' + (e && e.message ? e.message : e));
+        btnSaveEdit.disabled = false;
+        btnSaveEdit.textContent = zhOverviewExists ? '💾 保存修改' : '💾 保存';
+      }
+    };
+  }
 }
 
 // ============================================================
@@ -1556,6 +1703,20 @@ class Handler(BaseHTTPRequestHandler):
                 if res is None:
                     return self._send_json({'error': 'not found'}, 404)
                 return self._send_json(res)
+            m = re.match(r'^/api/paper/([^/]+)/ai_overview_zh/clear$', path)
+            if m:
+                pid = urllib.parse.unquote(m.group(1))
+                res = api_clear_ai_overview_zh(conn, pid)
+                if res is None:
+                    return self._send_json({'error': 'not found'}, 404)
+                return self._send_json(res)
+            m = re.match(r'^/api/paper/([^/]+)/ai_overview_zh/update$', path)
+            if m:
+                pid = urllib.parse.unquote(m.group(1))
+                res = api_update_ai_overview_zh(conn, pid, payload)
+                if res is None:
+                    return self._send_json({'error': 'not found'}, 404)
+                return self._send_json(res)
             return self._send_json({'error': 'unknown api'}, 404)
         finally:
             conn.close()
@@ -1617,10 +1778,12 @@ def main():
         sys.exit(2)
     port_used_note = '' if used_port == args.port else f' (原 {args.port} 被占用，已自动使用 {used_port})'
     url = f"http://{args.host}:{used_port}/"
+    pid = os.getpid()
     print()
     print(f"  ╔══════════════════════════════════════════════════════╗")
     print(f"  ║  🚀  PaperGrep Super DB Viewer 已启动{port_used_note:<26s}║")
     print(f"  ║  🌐  浏览器访问: {url:<43s} ║")
+    print(f"  ║  🖥  IP: {args.host:<17s}  端口: {used_port:<6d}  PID: {pid:<7d}       ║")
     print(f"  ║  💾  数据库: {os.path.abspath(db_path):<50s} ║")
     print(f"  ║  📊  论文: {stats['paper_count']:<6d}  评论: {stats['comment_count']:<6d}  运行: {stats['run_count']:<5d}    ║")
     print(f"  ║  ⏹  按 Ctrl+C 停止服务器                             ║")

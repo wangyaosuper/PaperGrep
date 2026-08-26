@@ -2290,6 +2290,173 @@ def build_and_save_report(conn, new_paper_ids, updated, new_comments, ranking_be
 
 
 # ============================================================
+# Refill Mode
+# ============================================================
+
+def refill_missing_data(conn, translator, args):
+    """Refill mode: scan DB for papers missing AI Overview or Chinese AI Overview.
+    Fetch missing ai_overview_en from alphaXiv detail pages, then call LLM
+    to generate/summarize Chinese AI Overview. Returns (refilled_paper_ids, stats_dict).
+    """
+    print("[INFO] [REFILL] 模式：扫描数据库中缺失 AI Overview / 中文 AI Overview 的论文 …")
+    now = datetime.now().isoformat(timespec='seconds')
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM papers")
+    total_papers = c.fetchone()[0]
+    print(f"[INFO]   数据库总论文数：{total_papers}")
+
+    c.execute("""
+        SELECT paper_id, url, title_en, title_zh,
+               ai_overview_en, ai_overview_zh, ai_overview_summary_zh,
+               translated_fields
+        FROM papers
+    """)
+    all_rows = [dict(r) for r in c.fetchall()]
+
+    need_detail_fetch = []
+    need_zh_overview = []
+    for r in all_rows:
+        tf = {}
+        try:
+            tf = json.loads(r.get('translated_fields') or '{}') or {}
+        except Exception:
+            tf = {}
+        has_en = bool(r.get('ai_overview_en') and str(r['ai_overview_en']).strip())
+        has_zh = bool(r.get('ai_overview_zh') and str(r['ai_overview_zh']).strip())
+        zh_flagged = bool(tf.get('ai_overview_zh'))
+        if not has_en:
+            url = r.get('url') or f"https://www.alphaxiv.org/abs/{r['paper_id']}"
+            need_detail_fetch.append((r['paper_id'], url, r))
+        if not has_zh:
+            need_zh_overview.append((r['paper_id'], r))
+
+    print(f"[INFO]   缺失 ai_overview_en：{len(need_detail_fetch)} 篇（需从 alphaxiv.org 抓取详情页）")
+    print(f"[INFO]   缺失 ai_overview_zh：{len(need_zh_overview)} 篇（需调用大模型生成中文概述）")
+
+    fetched_detail_map = {}
+    if need_detail_fetch:
+        print(f"[INFO] [REFILL 1/3] 并发抓取 {len(need_detail_fetch)} 篇论文详情页，获取 AI Overview 英文原文 …")
+        n = len(need_detail_fetch)
+        done_cnt = 0
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            fut_map = {ex.submit(fetch_paper_details, url): (pid, r) for (pid, url, r) in need_detail_fetch}
+            for fut in as_completed(fut_map):
+                pid, orig_r = fut_map[fut]
+                try:
+                    detail = fut.result() or {}
+                    fetched_detail_map[pid] = detail
+                    ov = detail.get('ai_overview_en') or ''
+                    if ov and ov.strip():
+                        comments = detail.get('comments', [])
+                        cc = detail.get('comment_count', len(comments)) if detail else 0
+                        abstract_full = detail.get('abstract_en_full') or ''
+                        prev_en_hash = content_hash(orig_r.get('ai_overview_en') or '')
+                        new_en_hash = content_hash(ov)
+                        if prev_en_hash != new_en_hash:
+                            try:
+                                tfields = json.loads(orig_r.get('translated_fields') or '{}') or {}
+                            except Exception:
+                                tfields = {}
+                            tfields.pop('ai_overview_zh', None)
+                            updates = {
+                                'ai_overview_en': ov,
+                                'ai_overview_hash': new_en_hash,
+                                'translated_fields': json.dumps(tfields, ensure_ascii=False),
+                                'last_updated': now,
+                            }
+                            if cc and str(orig_r.get('comment_count') or '0') != str(max(cc, 0)):
+                                updates['comment_count'] = max(cc, 0)
+                            if abstract_full and len(abstract_full) > len(orig_r.get('abstract_en') or ''):
+                                abs_hash = content_hash(abstract_full)
+                                if (orig_r.get('abstract_hash') or '') != abs_hash:
+                                    updates['abstract_en'] = abstract_full
+                                    updates['abstract_hash'] = abs_hash
+                            set_clause = ', '.join(f"{k}=?" for k in updates)
+                            params = list(updates.values()) + [pid]
+                            c.execute(f"UPDATE papers SET {set_clause} WHERE paper_id=?", params)
+                            if comments:
+                                _sync_comments_for(conn, pid, comments, [], now)
+                            conn.commit()
+                except Exception:
+                    fetched_detail_map[pid] = {}
+                done_cnt += 1
+                if done_cnt % 5 == 0 or done_cnt == n:
+                    print(f"[INFO]     详情页进度 {done_cnt}/{n}")
+
+    c.execute("""
+        SELECT paper_id, ai_overview_en, translated_fields
+        FROM papers
+        WHERE (ai_overview_en IS NOT NULL AND ai_overview_en != '')
+          AND (
+              (translated_fields IS NULL OR json_extract(translated_fields, '$.ai_overview_zh') IS NULL)
+              OR ai_overview_zh IS NULL
+              OR ai_overview_zh = ''
+          )
+    """)
+    zh_task_rows = [dict(r) for r in c.fetchall()]
+    print(f"[INFO] [REFILL 2/3] 需生成中文 AI Overview 的论文：{len(zh_task_rows)} 篇（已刷新详情页后重算）")
+
+    tasks = []
+    row_map = {}
+    for r in zh_task_rows:
+        if r.get('ai_overview_en') and str(r['ai_overview_en']).strip():
+            key = f"OVERVIEW::{r['paper_id']}"
+            tasks.append((key, r['ai_overview_en']))
+            row_map[r['paper_id']] = r
+
+    refilled_ids = []
+    stats = {
+        'detail_fetched': len([pid for pid, d in fetched_detail_map.items() if d and d.get('ai_overview_en')]),
+        'zh_overview_generated': 0,
+    }
+
+    if tasks:
+        print(f"[INFO] [REFILL 3/3] 调用大模型生成中文结构化概述，共 {len(tasks)} 项 (model={translator.model}) …")
+        route = 'DashScope 原生 SDK' if translator.model == 'qwen-plus' else 'OpenAI 兼容接口'
+        print(f"[INFO]   使用路由：{route}")
+        translated_map = translator.translate_batch(tasks)
+        got = len(translated_map)
+        print(f"[INFO]   大模型返回：{got}/{len(tasks)} 条结果")
+
+        by_paper_updates = {}
+        for key, zh in translated_map.items():
+            if not zh:
+                continue
+            kind, _, rest = key.partition('::')
+            if kind in ('OVERVIEW_B', 'OVERVIEW_S', 'OVERVIEW_F', 'OVERVIEW'):
+                pid = rest
+                overview_text = str(zh).strip()
+                if overview_text:
+                    orig_r = row_map.get(pid) or {}
+                    try:
+                        tfields = json.loads((orig_r.get('translated_fields') if orig_r else None) or '{}') or {}
+                    except Exception:
+                        tfields = {}
+                    tfields['ai_overview_zh'] = True
+                    prev = by_paper_updates.get(pid, {})
+                    prev['ai_overview_zh'] = overview_text
+                    prev['translated'] = tfields
+                    by_paper_updates[pid] = prev
+
+        for pid, up in by_paper_updates.items():
+            zh_text = up['ai_overview_zh']
+            tfields_json = json.dumps(up['translated'], ensure_ascii=False)
+            c.execute("""
+                UPDATE papers SET ai_overview_zh=?, ai_overview_summary_zh=?, translated_fields=?, last_updated=?
+                WHERE paper_id=?
+            """, (zh_text, zh_text, tfields_json, now, pid))
+            refilled_ids.append(pid)
+        conn.commit()
+        stats['zh_overview_generated'] = len(by_paper_updates)
+        print(f"[INFO]   已写入中文 AI Overview：{stats['zh_overview_generated']} 篇")
+    else:
+        print("[INFO]   没有需要生成中文概述的论文，跳过 LLM 调用")
+
+    return refilled_ids, stats
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -2298,11 +2465,16 @@ def build_arg_parser():
         prog='PaperGrep.py',
         description='Fetch, persist, translate, and report papers from alphaXiv.org',
     )
-    p.add_argument('--category', type=str, required=True,
+    p.add_argument('--refill', action='store_true',
+                   help='Refill mode: scan DB for papers missing AI Overview or Chinese AI Overview, '
+                        'fetch details from alphaXiv.org and call LLM to translate/summarize. '
+                        'Does NOT process webarchive files.')
+    p.add_argument('--category', type=str, required=False,
                    choices=['self-driving', 'robot'],
                    help='Assign a category to papers scraped in this run. '
                         'Must be exactly "self-driving" or "robot". '
-                        'Categories are additive: a paper can have multiple categories across runs.')
+                        'Categories are additive: a paper can have multiple categories across runs. '
+                        'Required for normal scraping mode, not required for --refill mode.')
     p.add_argument('--after', type=str, default=None,
                    help='Only include papers published on/after this datetime. '
                         'Formats: YYYY-MM-DD or "YYYY-MM-DD HH:MM"')
@@ -2334,13 +2506,66 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # --files take precedence over --dir
-    if args.files:
-        args.dir = None  # will collect files manually below
-
     global DB_PATH
     if args.db:
         DB_PATH = os.path.abspath(args.db)
+
+    # Set model env for translator
+    if args.model:
+        os.environ['PAPERGREP_MODEL'] = args.model
+
+    ensure_dirs()
+    init_db()
+
+    # ============================================================
+    # --refill MODE (independent, no webarchive processing)
+    # ============================================================
+    if args.refill:
+        print("=" * 80)
+        print(f"PaperGrep 启动 [REFILL 模式] — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 80)
+        print(f"  DB：        {DB_PATH}")
+        print(f"  模式：      --refill（仅补全缺失 AI Overview，不处理 webarchive）")
+        print(f"  模型：      {args.model}")
+        print(f"  协议：      {args.protocol}")
+        print(f"  LLM 日志：  {'DEBUG' if args.llm_verbose else 'INFO/WARN'}")
+        print("=" * 80)
+        print()
+
+        conn = get_db()
+        translator = LLMTranslator(model_name=args.model, protocol=args.protocol, verbose=args.llm_verbose)
+        route = 'DashScope 原生 SDK (qwen-plus)' if translator.model == 'qwen-plus' else f'OpenAI 兼容接口 ({translator.model})'
+        print(f"[INFO] LLM translator：{route}，可用={translator.available()}，协议={translator.protocol!r}")
+        if not translator.available():
+            print("[WARN] 未配置 DASHSCOPE_API_KEY，LLM 相关功能（生成中文概述）将被跳过，仅能从 alphaXiv 抓取英文 Overview。")
+        print()
+
+        refilled_ids, stats = refill_missing_data(conn, translator, args)
+
+        conn.close()
+        print()
+        print("=" * 80)
+        print(f"PaperGrep [REFILL 模式] 完成 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 80)
+        print(f"  📥  从 alphaxiv 补全英文 AI Overview : {stats.get('detail_fetched', 0)} 篇")
+        print(f"  🤖  大模型生成中文结构化概述         : {stats.get('zh_overview_generated', 0)} 篇")
+        print(f"  📊  本次受影响论文总数               : {len(refilled_ids)} 篇")
+        if refilled_ids:
+            print(f"  📄  受影响 paper_ids 样例（前 10）   : {', '.join(refilled_ids[:10])}")
+        print("=" * 80)
+        return
+
+    # ============================================================
+    # NORMAL MODE (webarchive scraping + translation + report)
+    # ============================================================
+
+    if not args.category:
+        print("[ERROR] Normal mode requires --category (choices: self-driving, robot). Use --refill to run without category.")
+        sys.exit(1)
+
+    # --files take precedence over --dir
+    if args.files:
+        args.dir = None  # will collect files manually below
 
     print("=" * 80)
     print(f"PaperGrep 启动 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2357,8 +2582,6 @@ def main():
     print("=" * 80)
     print()
 
-    ensure_dirs()
-    init_db()
     conn = get_db()
 
     after_dt = parse_time_filter(args.after)
@@ -2419,10 +2642,6 @@ def main():
     if not papers:
         print("[WARN] No papers to process. Exiting.")
         return
-
-    # Set model env for translator
-    if args.model:
-        os.environ['PAPERGREP_MODEL'] = args.model
 
     translator = LLMTranslator(model_name=args.model, protocol=args.protocol, verbose=args.llm_verbose)
     route = 'DashScope 原生 SDK (qwen-plus)' if translator.model == 'qwen-plus' else f'OpenAI 兼容接口 ({translator.model})'
