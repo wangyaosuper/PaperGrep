@@ -27,8 +27,10 @@ PaperGrep 是一个用于自动抓取、翻译并追踪论文社区动态的脚�
 
 ### 翻译（LLM）
 - **双路由调用**：
-  - 默认模型：`qwen-plus` → 使用 DashScope 原生 SDK（`dashscope.Generation.call(prompt=..., max_tokens=32000, temperature=0.7)`）
-  - `deepseek-v4-pro` / `qwen3.6-plus` / 其他模型 → 使用 OpenAI 兼容接口（`base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"`，`messages=[system+user]`）
+  - 默认模型：`qwen3.8-max` → 通过 DashScope OpenAI 兼容接口调用（`base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"`，`messages=[system+user]`）
+  - DashScope 原生 SDK 白名单（`qwen-plus`、`qwen-max`、`qwen-turbo`、`qwen-long` 等老一代）→ 使用 `dashscope.Generation.call(prompt=..., max_tokens=32000, temperature=0.7)`
+  - 新一代 qwen3.x-* 系列（qwen3.8-max、qwen3.6-plus 等）全部走 OpenAI 兼容接口
+  - `deepseek-v4-pro` / 其他非 qwen 前缀模型 → 同样使用 OpenAI 兼容接口
   - 统一读取环境变量 `DASHSCOPE_API_KEY`
 - **双协议可选**：
   - `--protocol json`（默认）：要求模型输出顶层 JSON `{"0":…, "1":…}`，配合多级容错解析（strict → strict=False → 转义消毒 → 正则单键救援）
@@ -77,8 +79,8 @@ positional:  files...             显式指定一个或多个 .webarchive 文件
              "YYYY-MM-DD HH:MM"   只保留发布时间 ≥ 该时刻的论文
 --before     "YYYY-MM-DD"
              "YYYY-MM-DD HH:MM"   只保留发布时间 ≤ 该时刻的论文（仅日期时用当天 23:59:59 补齐）
---model      qwen-plus | deepseek-v4-pro | qwen3.6-plus | ...
-                                  指定翻译模型（默认 qwen-plus，亦可通过 $PAPERGREP_MODEL 设置）
+--model      qwen3.8-max | qwen-plus | deepseek-v4-pro | qwen3.6-plus | ...
+                                  指定翻译模型（默认 qwen3.8-max，亦可通过 $PAPERGREP_MODEL 设置）
 --protocol   json | xml           LLM 输出协议（默认 json，亦可通过 $PAPERGREP_PROTOCOL 设置）
                                   xml 模式用 <item_N>…</item_N> 标签分隔，对译文含大量引号/反斜杠的场景更稳
 --llm-verbose                      打开 LLM DEBUG 日志（prompt 长度、原始响应、分块解析过程）
@@ -95,7 +97,7 @@ positional:  files...             显式指定一个或多个 .webarchive 文件
 | 变量 | 作用 | 默认 |
 |---|---|---|
 | `DASHSCOPE_API_KEY` | DashScope / OpenAI 兼容接口的 API Key（必填，否则跳过翻译） | — |
-| `PAPERGREP_MODEL` | 默认翻译模型名，被 `--model` 覆盖 | `qwen-plus` |
+| `PAPERGREP_MODEL` | 默认翻译模型名，被 `--model` 覆盖 | `qwen3.8-max` |
 | `PAPERGREP_PROTOCOL` | 默认 LLM 输出协议，被 `--protocol` 覆盖 | `json` |
 | `PAPERGREP_LLM_VERBOSE` | 设为 `1/true/yes/on` 打开 LLM DEBUG 日志 | 关闭 |
 
@@ -133,13 +135,13 @@ pip install requests beautifulsoup4 urllib3 dashscope openai
 
 ### 2. 设置 API Key
 ```bash
-# DashScope（阿里云百炼，支持 qwen-plus / deepseek-v4-pro / qwen3.6-plus）
+# DashScope（阿里云百炼，支持 qwen 系列 / deepseek-v4-pro / qwen3.6-plus）
 export DASHSCOPE_API_KEY="sk-..."
 ```
 
 ### 3. 运行主脚本
 ```bash
-# 最简单：用默认 cache/alphaXiv.webarchive + 默认 qwen-plus + 抓详情页
+# 最简单：用默认 cache/alphaXiv.webarchive + 默认 qwen3.8-max + 抓详情页
 python PaperGrep.py
 
 # 只看 8 月 12 日后新增论文，不抓详情（快很多）
@@ -370,12 +372,12 @@ FROM papers ORDER BY likes DESC, first_seen ASC LIMIT 50
 
 | 模型名 | 调用方式 | API Key |
 |---|---|---|
-| `qwen-plus`（默认） | DashScope 原生 SDK：`Generation.call(model, prompt, max_tokens=32000, temperature=0.7)` | `DASHSCOPE_API_KEY` |
-| 以 `deepseek` 开头 | OpenAI 兼容：`base_url=https://dashscope.aliyuncs.com/compatible-mode/v1`，`messages` 带 system+user | `DASHSCOPE_API_KEY` |
-| 以 `qwen3.6` 开头 | OpenAI 兼容，同上 | `DASHSCOPE_API_KEY` |
+| 默认 `qwen3.8-max`、所有 `qwen3.*-*` 系列 | OpenAI 兼容：`base_url=https://dashscope.aliyuncs.com/compatible-mode/v1`，`messages` 带 system+user | `DASHSCOPE_API_KEY` |
+| DashScope 原生白名单（`qwen-plus` / `qwen-max` / `qwen-turbo` / `qwen-long` 等老一代） | DashScope 原生 SDK：`Generation.call(model, prompt, max_tokens=32000, temperature=0.7)` | `DASHSCOPE_API_KEY` |
+| 以 `deepseek` 开头 | OpenAI 兼容，同上 | `DASHSCOPE_API_KEY` |
 | 其他自定义模型名 | OpenAI 兼容，同上 | `DASHSCOPE_API_KEY` |
 
-调用失败按 `max_retries=2` 重试，退避 `10 * attempt` 秒。`qwen-plus` 走原生 SDK 时会把 system + user 合并成单个 prompt（DashScope 原生接口不接受 messages）。
+调用失败按 `max_retries=2` 重试，退避 `10 * attempt` 秒。DashScope 原生 SDK 白名单模型调用时会把 system + user 合并成单个 prompt（DashScope 原生 `Generation.call` 接口不接受 messages 参数）。
 
 ### 批量翻译请求格式
 

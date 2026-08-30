@@ -834,7 +834,42 @@ def content_hash(s):
 # LLM Translation (DashScope / OpenAI compatible)
 # ============================================================
 
-def call_qwen_plus(prompt, model='qwen-plus', timeout=600, max_retries=2, verbose=False):
+DASHSCOPE_NATIVE_MODELS = frozenset((
+    'qwen-turbo',
+    'qwen-plus',
+    'qwen-max',
+    'qwen-max-longcontext',
+    'qwen-long',
+    'qwen-coder-plus',
+    'qwen-math-plus',
+))
+
+
+def _use_dashscope_native(model_name):
+    """判断模型名是否支持 DashScope 原生 SDK (Generation.call)。
+
+    支持范围：DashScope 原生 SDK 白名单中的老一代模型（qwen-plus / qwen-max 等）。
+    不支持：新一代 qwen3.x-* 系列（只能走 DashScope HTTP / OpenAI 兼容接口）、
+            deepseek 系列和其他自定义模型名。
+    """
+    if not model_name:
+        return False
+    base = model_name.strip()
+    if base in DASHSCOPE_NATIVE_MODELS:
+        return True
+    if base.endswith('-latest') and base[:-7] in DASHSCOPE_NATIVE_MODELS:
+        return True
+    # 兼容日期后缀版本，例如 qwen-plus-2024-09-19
+    for m in DASHSCOPE_NATIVE_MODELS:
+        if base.startswith(m + '-') and len(base) > len(m) + 1:
+            tail = base[len(m) + 1:]
+            # 日期后缀形如 2024-09-19
+            if len(tail) == 10 and tail[4] == '-' and tail[7] == '-':
+                return True
+    return False
+
+
+def call_qwen_plus(prompt, model='qwen3.8-max', timeout=600, max_retries=2, verbose=False):
     """调用阿里云大模型（使用原生SDK，参考 AnalysisGrepOutput.py 方式）"""
     api_key = os.environ.get('DASHSCOPE_API_KEY')
     if not api_key:
@@ -871,10 +906,22 @@ def call_qwen_plus(prompt, model='qwen-plus', timeout=600, max_retries=2, verbos
                 print(f"[DEBUG][LLM] call_qwen_plus: response output_len={len(out)} chars, first_300={out[:300]!r}")
             return out
         else:
-            print(f"[DEBUG][LLM] call_qwen_plus ERROR: message={response.message}")
+            msg = str(response.message or '')
+            if 'url error' in msg.lower() or 'url' in msg.lower() and 'error' in msg.lower():
+                hint = (
+                    f"HINT: 模型 '{model}' 可能不支持 DashScope 原生 SDK (Generation.call)。\n"
+                    f"       新一代 qwen3.x-* 系列、qwen3.8-max 等需通过 OpenAI 兼容接口调用。\n"
+                    f"       请检查路由逻辑 _use_dashscope_native()，或切换为 --model qwen-plus 重试。\n"
+                    f"       原始错误: {msg}"
+                )
+                print(f"[DEBUG][LLM] call_qwen_plus ERROR: {hint}")
+                if hasattr(response, 'request_id'):
+                    print(f"[DEBUG][LLM] call_qwen_plus request_id={response.request_id}")
+                raise Exception(f"API调用失败: {hint}")
+            print(f"[DEBUG][LLM] call_qwen_plus ERROR: message={msg}")
             if hasattr(response, 'request_id'):
                 print(f"[DEBUG][LLM] call_qwen_plus request_id={response.request_id}")
-            raise Exception(f"API调用失败: {response.message}")
+            raise Exception(f"API调用失败: {msg}")
     if last_exc:
         raise last_exc
 
@@ -926,7 +973,7 @@ class LLMTranslator:
     PROTOCOL_XML = 'xml'
 
     def __init__(self, model_name=None, protocol=None, verbose=None):
-        self.model = model_name or os.environ.get('PAPERGREP_MODEL', 'qwen-plus')
+        self.model = model_name or os.environ.get('PAPERGREP_MODEL', 'qwen3.8-max')
         self.api_key = os.environ.get('DASHSCOPE_API_KEY')
         env_proto = (os.environ.get('PAPERGREP_PROTOCOL') or '').strip().lower()
         if protocol is None:
@@ -951,7 +998,7 @@ class LLMTranslator:
         self._debug(f"_call_model enter: model={self.model}, prompt_len={len(prompt)}, system_len={len(system_message or '')}")
         t0 = datetime.now()
         try:
-            if self.model == 'qwen-plus':
+            if _use_dashscope_native(self.model):
                 merged = f"{system_message}\n\n{prompt}" if system_message else prompt
                 result = call_qwen_plus(merged, self.model, verbose=self.verbose)
             else:
@@ -989,7 +1036,7 @@ class LLMTranslator:
             "",
             "For each input i, output JSON value at position i:",
             "  - For TITLE / ABSTRACT / COMMENT inputs: output a single STRING (the full Chinese translation).",
-            "  - For AI OVERVIEW inputs: output a single STRING — a Chinese summary of about 1500 characters, covering: 研究问题与动机, 相关工作与痛点, 核心方法与技术细节, 关键创新点, 主要实验设置, 实验结果与分析, 局限性与未来方向, 结论与应用价值。Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce a structured, readable ~1500-character Chinese overview.",
+            "  - For AI OVERVIEW inputs: output a single STRING — a structured Chinese summary of about 1500 characters. Format requirements: each section MUST start with a bracketed prefix like 【研究问题与动机】, 【相关工作与痛点】, 【核心方法与技术细节】, 【关键创新点】, 【主要实验设置】, 【实验结果与分析】, 【局限性与未来方向】, 【结论与应用价值】. Each section MUST be separated by a blank line (\\\\n\\\\n). Cover all these sections. Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce this structured, readable ~1500-character Chinese overview.",
             "",
             "Wrap all outputs in a single top-level JSON object in the format: {\"0\": value0, \"1\": value1, ...}.",
             "Output JSON ONLY, no prose, no markdown fences.",
@@ -1016,7 +1063,7 @@ class LLMTranslator:
             "    <your translated content for item i>",
             "  </item_i>",
             "  - For TITLE / ABSTRACT / COMMENT inputs: content inside the tags is a plain Chinese string (full translation).",
-            "  - For AI OVERVIEW inputs: content inside the tags is a plain Chinese string — a structured overview of about 1500 characters, covering: 研究问题与动机, 相关工作与痛点, 核心方法与技术细节, 关键创新点, 主要实验设置, 实验结果与分析, 局限性与未来方向, 结论与应用价值。Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce a readable ~1500-character Chinese overview.",
+            "  - For AI OVERVIEW inputs: content inside the tags is a plain Chinese string — a structured overview of about 1500 characters. Format requirements: each section MUST start with a bracketed prefix like 【研究问题与动机】, 【相关工作与痛点】, 【核心方法与技术细节】, 【关键创新点】, 【主要实验设置】, 【实验结果与分析】, 【局限性与未来方向】, 【结论与应用价值】. Each section MUST be separated by a blank line (\\n\\n). Cover all these sections. Do NOT output a full word-by-word translation (formulas and pseudocode rarely translate well); just produce this readable ~1500-character Chinese overview.",
             "",
             "CRITICAL RULES for the XML delimiter format:",
             "  1. NEVER write the literal strings '</item_' anywhere inside the translated content itself. If the source contains them, rewrite slightly or insert a zero-width space.",
@@ -1686,7 +1733,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     by_paper_updates = {}
     comment_updates = []
     if tasks:
-        route = 'DashScope 原生 SDK' if translator.model == 'qwen-plus' else 'OpenAI 兼容接口'
+        route = f'DashScope 原生 SDK ({translator.model})' if _use_dashscope_native(translator.model) else f'OpenAI 兼容接口 ({translator.model})'
         overview_cnt = sum(1 for (k, _) in tasks if k.startswith('OVERVIEW'))
         print(f"[INFO]   使用路由：{route}  批量条目：{len(tasks)}（其中 AI Overview ~1500字中文结构化概述：{overview_cnt}）")
         translated_map = translator.translate_batch(tasks)
@@ -2413,7 +2460,7 @@ def refill_missing_data(conn, translator, args):
 
     if tasks:
         print(f"[INFO] [REFILL 3/3] 调用大模型生成中文结构化概述，共 {len(tasks)} 项 (model={translator.model}) …")
-        route = 'DashScope 原生 SDK' if translator.model == 'qwen-plus' else 'OpenAI 兼容接口'
+        route = f'DashScope 原生 SDK ({translator.model})' if _use_dashscope_native(translator.model) else f'OpenAI 兼容接口 ({translator.model})'
         print(f"[INFO]   使用路由：{route}")
         translated_map = translator.translate_batch(tasks)
         got = len(translated_map)
@@ -2480,8 +2527,8 @@ def build_arg_parser():
                         'Formats: YYYY-MM-DD or "YYYY-MM-DD HH:MM"')
     p.add_argument('--before', type=str, default=None,
                    help='Only include papers published on/before this datetime')
-    p.add_argument('--model', type=str, default=os.environ.get('PAPERGREP_MODEL', 'qwen-plus'),
-                   help='LLM model name for translation (default: qwen-plus via DashScope)')
+    p.add_argument('--model', type=str, default=os.environ.get('PAPERGREP_MODEL', 'qwen3.8-max'),
+                   help='LLM model name for translation (default: qwen3.8-max via DashScope)')
     p.add_argument('--protocol', type=str, default=os.environ.get('PAPERGREP_PROTOCOL', 'json'),
                    choices=['json', 'xml'],
                    help='LLM output protocol: "json" (default, strict top-level JSON) or '
@@ -2534,7 +2581,7 @@ def main():
 
         conn = get_db()
         translator = LLMTranslator(model_name=args.model, protocol=args.protocol, verbose=args.llm_verbose)
-        route = 'DashScope 原生 SDK (qwen-plus)' if translator.model == 'qwen-plus' else f'OpenAI 兼容接口 ({translator.model})'
+        route = f'DashScope 原生 SDK ({translator.model})' if _use_dashscope_native(translator.model) else f'OpenAI 兼容接口 ({translator.model})'
         print(f"[INFO] LLM translator：{route}，可用={translator.available()}，协议={translator.protocol!r}")
         if not translator.available():
             print("[WARN] 未配置 DASHSCOPE_API_KEY，LLM 相关功能（生成中文概述）将被跳过，仅能从 alphaXiv 抓取英文 Overview。")
@@ -2644,7 +2691,7 @@ def main():
         return
 
     translator = LLMTranslator(model_name=args.model, protocol=args.protocol, verbose=args.llm_verbose)
-    route = 'DashScope 原生 SDK (qwen-plus)' if translator.model == 'qwen-plus' else f'OpenAI 兼容接口 ({translator.model})'
+    route = f'DashScope 原生 SDK ({translator.model})' if _use_dashscope_native(translator.model) else f'OpenAI 兼容接口 ({translator.model})'
     print(f"[INFO] LLM translator：{route}，可用={translator.available()}，协议={translator.protocol!r}，DEBUG 日志={'开启' if translator.verbose else '关闭'}")
 
     new_ids, updated, new_comments, rank_before, rank_after, trans_updates, comment_trans = sync_papers(
