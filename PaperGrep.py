@@ -2681,10 +2681,10 @@ def main():
     else:
         print(f"[INFO] [3/7] 无时间过滤：保留全部 {before_cnt} 篇论文")
 
-    # Likes filter: drop papers with likes < 3
+    # Likes filter: drop papers with likes < 5
     likes_before = len(papers)
-    papers = [p for p in papers if p.get('likes', 0) >= 3]
-    print(f"[INFO] [3.5/7] 点赞过滤（likes >= 3）：保留 {len(papers)}/{likes_before} 篇论文")
+    papers = [p for p in papers if p.get('likes', 0) >= 5]
+    print(f"[INFO] [3.5/7] 点赞过滤（likes >= 5）：保留 {len(papers)}/{likes_before} 篇论文")
 
     if not papers:
         print("[WARN] No papers to process. Exiting.")
