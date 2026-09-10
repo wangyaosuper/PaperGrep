@@ -1497,11 +1497,12 @@ def _clip(s, n):
     return (s[:n] + '…') if len(s) > n else s
 
 
-def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=None):
+def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=None, auto_confirm=False):
     """Insert/update papers, detect changes, trigger translations when needed.
     Categories are additive: if `category` is provided, it is merged (union) into existing categories.
-    Returns (new_paper_ids, updated_papers_info, new_comments_info, likes_ranking_before, likes_ranking_after, translation_updates, comment_translations)"""
-    print(f"[INFO] [4/7] 同步 {len(fetched_papers)} 篇论文到数据库 …")
+    All DB writes are delayed until after user review (unless auto_confirm=True).
+    Returns (new_paper_ids, updated_papers_info, new_comments_info, likes_ranking_before, likes_ranking_after, translation_updates, comment_translations, confirmed)"""
+    print(f"[INFO] [4/7] 同步 {len(fetched_papers)} 篇论文（翻译 + 待审核，未写入数据库） …")
     if category:
         print(f"[INFO]   本次标记类别：{category}（累加到已有类别）")
     now = datetime.now().isoformat(timespec='seconds')
@@ -1514,6 +1515,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     new_paper_ids = []
     updated = []
     new_comments = []
+    paper_categories = {}
 
     # 1) Per-paper fetch details (optional) in parallel
     if fetch_details:
@@ -1559,6 +1561,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
             abstract_full = abstract_full_incoming
             ai_overview = ai_overview_incoming
             new_categories = [category] if category else []
+            paper_categories[pid] = list(new_categories)
             c.execute("""
                 INSERT INTO papers (paper_id, url, title_en, abstract_en, ai_overview_en, authors_json,
                     published_date, modified_date, likes, views, comment_count,
@@ -1648,6 +1651,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
             changes.append({'field': 'categories',
                             'before': prev_categories,
                             'after': merged_categories})
+        paper_categories[pid] = list(merged_categories)
         merged_categories_json = json.dumps(merged_categories, ensure_ascii=False)
 
         c.execute("""
@@ -1670,10 +1674,9 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
         _sync_comments_for(conn, pid, comments, new_comments, now)
 
         if i % 10 == 0 or i == len(fetched_papers):
-            print(f"[INFO]     元数据写入 {i}/{len(fetched_papers)} (新增 {len(new_paper_ids)}，更新 {len(updated)})")
+            print(f"[INFO]     元数据暂存 {i}/{len(fetched_papers)} (新增 {len(new_paper_ids)}，更新 {len(updated)}) — 尚未写入数据库")
 
-    conn.commit()
-    print(f"[INFO]   元数据写入完成：新增 {len(new_paper_ids)}，更新 {len(updated)}，新评论 {len(new_comments)}")
+    print(f"[INFO]   元数据暂存完成：新增 {len(new_paper_ids)}，更新 {len(updated)}，新评论 {len(new_comments)} — 待翻译完成后统一审核并写入")
 
     # 2) Collect translation tasks (batch)
     #   集合 A：本次新入库或字段更新的论文（recent_set）
@@ -1798,13 +1801,12 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
                 else:
                     updated_markers.append(nc)
             new_comments[:] = updated_markers
-        conn.commit()
         overview_cnt = sum(1 for up in by_paper_updates.values() if up.get('ai_overview_zh'))
         title_tr_cnt = sum(1 for up in by_paper_updates.values() if up.get('title_zh'))
         abs_tr_cnt = sum(1 for up in by_paper_updates.values() if up.get('abstract_zh'))
-        print(f"[INFO]   翻译写入完成：论文字段 {len(by_paper_updates)} 条"
+        print(f"[INFO]   翻译暂存完成：论文字段 {len(by_paper_updates)} 条"
               f"（标题翻译 {title_tr_cnt}，摘要翻译 {abs_tr_cnt}，AI Overview ~1500字结构化概述 {overview_cnt}），"
-              f"评论 {len(comment_updates)} 条")
+              f"评论 {len(comment_updates)} 条 — 待审核后统一写入数据库")
     else:
         print(f"[INFO]   没有需要翻译的内容（全部已翻译或英文无变化），跳过 LLM 调用")
 
@@ -1878,8 +1880,220 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     c.execute("SELECT paper_id, title_en, title_zh, likes FROM papers ORDER BY likes DESC, first_seen ASC LIMIT 50")
     ranking_after = [dict(r) for r in c.fetchall()]
 
+    # ============================================================
+    # REVIEW & CONFIRM before DB write
+    # ============================================================
+    print()
+    print("=" * 80)
+    print("[REVIEW] 待写入数据库审核清单（全部翻译已完成，尚未 COMMIT）")
+    print("=" * 80)
+
+    fetched_map = {p['paper_id']: p for p in fetched_papers}
+    total_affected = len(new_paper_ids) + len(updated)
+
+    print(f"  本次影响论文总数  : {total_affected} 篇")
+    print(f"  🆕 新增论文       : {len(new_paper_ids)} 篇")
+    print(f"  🔄 更新论文       : {len(updated)} 篇")
+    print(f"  💬 新评论         : {len(new_comments)} 条")
+    print(f"  🌐 翻译补充论文   : {len(translation_updates)} 篇（标题/摘要/AI Overview）")
+    print(f"  🌐 翻译补充评论   : {len(comment_translations)} 条")
+    print()
+
+    # --- Section A: New papers ---
+    if new_paper_ids:
+        print("-" * 80)
+        print(f"【A】新增论文清单（{len(new_paper_ids)} 篇）")
+        print("-" * 80)
+        for i, pid in enumerate(new_paper_ids, 1):
+            fp = fetched_map.get(pid, {})
+            title = fp.get('title_en', pid)
+            cats = paper_categories.get(pid, [])
+            cat_str = ', '.join(cats) if cats else '(无)'
+            likes = fp.get('likes', 0)
+            views = fp.get('views', 0)
+            cc = fp.get('comment_count', 0)
+            print(f"  {i:>3}. [{cat_str}]")
+            print(f"        👍 点赞: {likes}   👁 浏览: {views}   💬 评论: {cc}")
+            print(f"        {title}")
+            print(f"        ID: {pid}")
+        print()
+
+    # --- Section B: Updated papers ---
+    if updated:
+        print("-" * 80)
+        print(f"【B】更新论文清单（{len(updated)} 篇）")
+        print("-" * 80)
+        likes_changed_n = 0
+        views_changed_n = 0
+        comments_changed_n = 0
+        likes_increased_total = 0
+        views_increased_total = 0
+        for i, u in enumerate(updated, 1):
+            pid = u['paper_id']
+            title = u.get('title_en') or pid
+            cats = paper_categories.get(pid, [])
+            cat_str = ', '.join(cats) if cats else '(无)'
+            # Extract metric deltas first
+            likes_before = None
+            likes_after = None
+            views_before = None
+            views_after = None
+            cc_before = None
+            cc_after = None
+            other_changes = []
+            for ch in u.get('changes', []):
+                f = ch.get('field', '')
+                if f == 'likes':
+                    likes_before = ch.get('before')
+                    likes_after = ch.get('after')
+                elif f == 'views':
+                    views_before = ch.get('before')
+                    views_after = ch.get('after')
+                elif f == 'comment_count':
+                    cc_before = ch.get('before')
+                    cc_after = ch.get('after')
+                elif f == 'title_en':
+                    other_changes.append('标题内容更新')
+                elif f == 'abstract_en':
+                    other_changes.append('摘要内容更新')
+                elif f == 'ai_overview_en':
+                    other_changes.append('AI Overview 内容更新')
+                elif f == 'categories':
+                    other_changes.append('类别变更')
+                elif f == 'modified_date':
+                    other_changes.append('修改日期变更')
+                elif f == 'title_zh':
+                    other_changes.append('标题翻译补充')
+                elif f == 'abstract_zh':
+                    other_changes.append('摘要翻译补充')
+                elif f == 'ai_overview_zh':
+                    other_changes.append('AI Overview 中文概述补充')
+                else:
+                    other_changes.append(f)
+
+            # Build metric line
+            metric_parts = []
+            if likes_before is not None and likes_after is not None:
+                likes_changed_n += 1
+                try:
+                    delta = int(likes_after) - int(likes_before)
+                    likes_increased_total += delta
+                    arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
+                except Exception:
+                    delta = 0
+                    arrow = '→'
+                metric_parts.append(f"👍 点赞: {likes_before} → {likes_after} ({arrow}{abs(delta)})")
+            if views_before is not None and views_after is not None:
+                views_changed_n += 1
+                try:
+                    delta = int(views_after) - int(views_before)
+                    views_increased_total += delta
+                    arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
+                except Exception:
+                    delta = 0
+                    arrow = '→'
+                metric_parts.append(f"👁 浏览: {views_before} → {views_after} ({arrow}{abs(delta)})")
+            if cc_before is not None and cc_after is not None:
+                comments_changed_n += 1
+                try:
+                    delta = int(cc_after) - int(cc_before)
+                    arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
+                except Exception:
+                    delta = 0
+                    arrow = '→'
+                metric_parts.append(f"💬 评论数: {cc_before} → {cc_after} ({arrow}{abs(delta)})")
+
+            metric_line = '   '.join(metric_parts) if metric_parts else '👍 指标: (无变化)'
+            trans_only = ' [仅翻译补全]' if u.get('_translation_only') else ''
+            changes_str = '; '.join(other_changes) if other_changes else '(无其他变更)'
+            print(f"  {i:>3}. [{cat_str}]{trans_only}")
+            print(f"        {metric_line}")
+            if other_changes:
+                print(f"        其他变更: {changes_str}")
+            print(f"        {title}")
+            print(f"        ID: {pid}")
+        print()
+
+    # --- Summary totals ---
+    print("-" * 80)
+    print("【C】变更统计汇总")
+    print("-" * 80)
+    # Metric summary (from above loop scope; re-scan to be safe regardless of list presence)
+    total_likes_delta = 0
+    total_views_delta = 0
+    likes_papers = 0
+    views_papers = 0
+    cc_papers = 0
+    for u in updated:
+        for ch in u.get('changes', []):
+            f = ch.get('field', '')
+            if f == 'likes':
+                likes_papers += 1
+                try:
+                    total_likes_delta += int(ch.get('after', 0)) - int(ch.get('before', 0))
+                except Exception:
+                    pass
+            elif f == 'views':
+                views_papers += 1
+                try:
+                    total_views_delta += int(ch.get('after', 0)) - int(ch.get('before', 0))
+                except Exception:
+                    pass
+            elif f == 'comment_count':
+                cc_papers += 1
+    new_papers_likes_total = sum(
+        int(fetched_map.get(pid, {}).get('likes', 0) or 0) for pid in new_paper_ids
+    )
+    print(f"  👍 新增论文总点赞     : {new_papers_likes_total} 赞（{len(new_paper_ids)} 篇）")
+    if likes_papers:
+        arrow = '↑' if total_likes_delta >= 0 else '↓'
+        print(f"  👍 点赞数变化论文     : {likes_papers} 篇（累计净变化 {arrow}{abs(total_likes_delta)} 赞）")
+    if views_papers:
+        arrow = '↑' if total_views_delta >= 0 else '↓'
+        print(f"  👁 浏览数变化论文     : {views_papers} 篇（累计净变化 {arrow}{abs(total_views_delta)}）")
+    if cc_papers:
+        print(f"  💬 评论数变化论文     : {cc_papers} 篇")
+    tr_title = sum(1 for t in translation_updates if 'title_zh' in t.get('fields', {}))
+    tr_abs = sum(1 for t in translation_updates if 'abstract_zh' in t.get('fields', {}))
+    tr_ov = sum(1 for t in translation_updates if 'ai_overview_zh' in t.get('fields', {}))
+    print(f"  标题翻译补充       : {tr_title} 篇")
+    print(f"  摘要翻译补充       : {tr_abs} 篇")
+    print(f"  AI Overview 中文   : {tr_ov} 篇")
+    print(f"  评论翻译补充       : {len(comment_translations)} 条")
+    print()
+    print("=" * 80)
+
+    # Interactive confirmation
+    confirmed = False
+    if auto_confirm:
+        print("[INFO] --yes 参数生效：自动确认，跳过交互审核")
+        confirmed = True
+    else:
+        while True:
+            try:
+                ans = input("请审核上述清单后确认写入数据库？输入 y 确认写入，输入其他任意键取消 (y/N): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                ans = 'n'
+            if ans == 'y' or ans == 'yes':
+                confirmed = True
+                break
+            else:
+                confirmed = False
+                break
+    print("=" * 80)
+    print()
+
+    if confirmed:
+        conn.commit()
+        print(f"[INFO] ✅ 已确认写入：新增 {len(new_paper_ids)}，更新 {len(updated)}，翻译 {len(translation_updates)} 篇论文 + {len(comment_translations)} 条评论")
+    else:
+        conn.rollback()
+        print("[INFO] ❌ 用户取消，全部变更已回滚（未写入数据库）")
+        return ([], [], [], ranking_before, ranking_before, [], [], False)
+
     return (new_paper_ids, updated, new_comments, ranking_before, ranking_after,
-            translation_updates, comment_translations)
+            translation_updates, comment_translations, confirmed)
 
 
 def _sync_comments_for(conn, paper_id, incoming_comments, new_comments_tracker, now_iso=None):
@@ -2544,6 +2758,8 @@ def build_arg_parser():
                    help='Skip per-paper detail page fetch (AI overview / comments / full abstract)')
     p.add_argument('--db', type=str, default=None,
                    help='Override DB path (default: db/papergrep.db)')
+    p.add_argument('--yes', action='store_true',
+                   help='Skip interactive confirmation and automatically approve all DB writes.')
     p.add_argument('files', nargs='*',
                    help='Optional explicit .webarchive file(s) to process')
     return p
@@ -2626,6 +2842,7 @@ def main():
     print(f"  时间范围：  after={args.after or '(无)'}  before={args.before or '(无)'}")
     print(f"  详情页：    {'关闭 (--no-details)' if args.no_details else '开启'}")
     print(f"  类别：      {args.category or '(无，不标记)'}")
+    print(f"  自动确认：  {'开启 (--yes，跳过交互审核)' if args.yes else '关闭（翻译完成后交互审核后再写入）'}")
     print("=" * 80)
     print()
 
@@ -2694,12 +2911,16 @@ def main():
     route = f'DashScope 原生 SDK ({translator.model})' if _use_dashscope_native(translator.model) else f'OpenAI 兼容接口 ({translator.model})'
     print(f"[INFO] LLM translator：{route}，可用={translator.available()}，协议={translator.protocol!r}，DEBUG 日志={'开启' if translator.verbose else '关闭'}")
 
-    new_ids, updated, new_comments, rank_before, rank_after, trans_updates, comment_trans = sync_papers(
+    new_ids, updated, new_comments, rank_before, rank_after, trans_updates, comment_trans, confirmed = sync_papers(
         conn, papers, translator, fetch_details=(not args.no_details),
         category=args.category,
+        auto_confirm=args.yes,
     )
-    build_and_save_report(conn, new_ids, updated, new_comments, rank_before, rank_after,
-                          trans_updates, comment_trans, args)
+    if confirmed:
+        build_and_save_report(conn, new_ids, updated, new_comments, rank_before, rank_after,
+                              trans_updates, comment_trans, args)
+    else:
+        print("[INFO] 用户取消写入，未生成报告，程序正常退出。")
     conn.close()
 
 
