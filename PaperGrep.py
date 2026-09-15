@@ -2760,6 +2760,10 @@ def build_arg_parser():
                    help='Override DB path (default: db/papergrep.db)')
     p.add_argument('--yes', action='store_true',
                    help='Skip interactive confirmation and automatically approve all DB writes.')
+    p.add_argument('--min-likes', type=int, default=None,
+                   help='Minimum likes threshold for a paper to be processed. '
+                        'Default depends on --category: self-driving=5, robot=10. '
+                        'Explicitly setting this overrides the category-based default.')
     p.add_argument('files', nargs='*',
                    help='Optional explicit .webarchive file(s) to process')
     return p
@@ -2826,6 +2830,14 @@ def main():
         print("[ERROR] Normal mode requires --category (choices: self-driving, robot). Use --refill to run without category.")
         sys.exit(1)
 
+    # Resolve --min-likes default based on category (if not explicitly specified)
+    if args.min_likes is None:
+        category_defaults = {'self-driving': 5, 'robot': 10}
+        args.min_likes = category_defaults.get(args.category, 5)
+        _min_likes_source = f"category default ({args.category})"
+    else:
+        _min_likes_source = "user specified (--min-likes)"
+
     # --files take precedence over --dir
     if args.files:
         args.dir = None  # will collect files manually below
@@ -2842,6 +2854,7 @@ def main():
     print(f"  时间范围：  after={args.after or '(无)'}  before={args.before or '(无)'}")
     print(f"  详情页：    {'关闭 (--no-details)' if args.no_details else '开启'}")
     print(f"  类别：      {args.category or '(无，不标记)'}")
+    print(f"  最低点赞：  likes >= {args.min_likes}（{_min_likes_source}；self-driving 默认 5，robot 默认 10）")
     print(f"  自动确认：  {'开启 (--yes，跳过交互审核)' if args.yes else '关闭（翻译完成后交互审核后再写入）'}")
     print("=" * 80)
     print()
@@ -2898,10 +2911,11 @@ def main():
     else:
         print(f"[INFO] [3/7] 无时间过滤：保留全部 {before_cnt} 篇论文")
 
-    # Likes filter: drop papers with likes < 5
+    # Likes filter: drop papers below --min-likes threshold (dynamic category default)
     likes_before = len(papers)
-    papers = [p for p in papers if p.get('likes', 0) >= 5]
-    print(f"[INFO] [3.5/7] 点赞过滤（likes >= 5）：保留 {len(papers)}/{likes_before} 篇论文")
+    min_likes = args.min_likes
+    papers = [p for p in papers if p.get('likes', 0) >= min_likes]
+    print(f"[INFO] [3.5/7] 点赞过滤（likes >= {min_likes}，{_min_likes_source}）：保留 {len(papers)}/{likes_before} 篇论文")
 
     if not papers:
         print("[WARN] No papers to process. Exiting.")
