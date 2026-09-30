@@ -1502,7 +1502,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     Categories are additive: if `category` is provided, it is merged (union) into existing categories.
     All DB writes are delayed until after user review (unless auto_confirm=True).
     Returns (new_paper_ids, updated_papers_info, new_comments_info, likes_ranking_before, likes_ranking_after, translation_updates, comment_translations, confirmed)"""
-    print(f"[INFO] [4/7] 同步 {len(fetched_papers)} 篇论文（翻译 + 待审核，未写入数据库） …")
+    print(f"[INFO] [4/6] 同步 {len(fetched_papers)} 篇论文（翻译 + 待审核，未写入数据库） …")
     if category:
         print(f"[INFO]   本次标记类别：{category}（累加到已有类别）")
     now = datetime.now().isoformat(timespec='seconds')
@@ -1732,7 +1732,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     for cr in comment_rows:
         tasks.append((f"COMMENT::{cr['id']}", cr['content_en']))
 
-    print(f"[INFO] [5/7] 调用大模型翻译：共 {len(tasks)} 项待翻译 (model={translator.model}) …")
+    print(f"[INFO] [5/6] 调用大模型翻译：共 {len(tasks)} 项待翻译 (model={translator.model}) …")
     by_paper_updates = {}
     comment_updates = []
     if tasks:
@@ -1941,15 +1941,21 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
             cc_before = None
             cc_after = None
             other_changes = []
+            has_likes_change = False
+            has_views_change = False
+            has_cc_change = False
             for ch in u.get('changes', []):
                 f = ch.get('field', '')
                 if f == 'likes':
+                    has_likes_change = True
                     likes_before = ch.get('before')
                     likes_after = ch.get('after')
                 elif f == 'views':
+                    has_views_change = True
                     views_before = ch.get('before')
                     views_after = ch.get('after')
                 elif f == 'comment_count':
+                    has_cc_change = True
                     cc_before = ch.get('before')
                     cc_after = ch.get('after')
                 elif f == 'title_en':
@@ -1972,38 +1978,65 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
                     other_changes.append(f)
 
             # Build metric line
+            fp = fetched_map.get(pid, {})
+            rp = row_map.get(pid, {})
+            # 当前值优先级：本次抓取 > 数据库快照
+            current_likes = fp.get('likes')
+            if current_likes is None or current_likes == 0:
+                current_likes = rp.get('likes', 0) or current_likes
+            current_views = fp.get('views')
+            if current_views is None or current_views == 0:
+                current_views = rp.get('views', 0) or current_views
+            current_cc = fp.get('comment_count')
+            if current_cc is None or current_cc == 0:
+                db_cc = rp.get('comment_count', 0) or 0
+                current_cc = db_cc if db_cc else current_cc
             metric_parts = []
-            if likes_before is not None and likes_after is not None:
+            # 统一把 None 视为 0 来显示和计算差值
+            def _safe_int(x):
+                try:
+                    if x is None or x == '':
+                        return 0
+                    return int(x)
+                except Exception:
+                    return 0
+            if has_likes_change:
                 likes_changed_n += 1
-                try:
-                    delta = int(likes_after) - int(likes_before)
-                    likes_increased_total += delta
-                    arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
-                except Exception:
-                    delta = 0
-                    arrow = '→'
-                metric_parts.append(f"👍 点赞: {likes_before} → {likes_after} ({arrow}{abs(delta)})")
-            if views_before is not None and views_after is not None:
+                b = _safe_int(likes_before)
+                a = _safe_int(likes_after)
+                delta = a - b
+                likes_increased_total += delta
+                arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
+                b_display = likes_before if likes_before is not None else 0
+                a_display = likes_after if likes_after is not None else 0
+                metric_parts.append(f"👍 点赞: {b_display} → {a_display} ({arrow}{abs(delta)})")
+            else:
+                metric_parts.append(f"👍 点赞: {current_likes}")
+            if has_views_change:
                 views_changed_n += 1
-                try:
-                    delta = int(views_after) - int(views_before)
-                    views_increased_total += delta
-                    arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
-                except Exception:
-                    delta = 0
-                    arrow = '→'
-                metric_parts.append(f"👁 浏览: {views_before} → {views_after} ({arrow}{abs(delta)})")
-            if cc_before is not None and cc_after is not None:
+                b = _safe_int(views_before)
+                a = _safe_int(views_after)
+                delta = a - b
+                views_increased_total += delta
+                arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
+                b_display = views_before if views_before is not None else 0
+                a_display = views_after if views_after is not None else 0
+                metric_parts.append(f"👁 浏览: {b_display} → {a_display} ({arrow}{abs(delta)})")
+            else:
+                metric_parts.append(f"👁 浏览: {current_views}")
+            if has_cc_change:
                 comments_changed_n += 1
-                try:
-                    delta = int(cc_after) - int(cc_before)
-                    arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
-                except Exception:
-                    delta = 0
-                    arrow = '→'
-                metric_parts.append(f"💬 评论数: {cc_before} → {cc_after} ({arrow}{abs(delta)})")
+                b = _safe_int(cc_before)
+                a = _safe_int(cc_after)
+                delta = a - b
+                arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
+                b_display = cc_before if cc_before is not None else 0
+                a_display = cc_after if cc_after is not None else 0
+                metric_parts.append(f"💬 评论数: {b_display} → {a_display} ({arrow}{abs(delta)})")
+            else:
+                metric_parts.append(f"💬 评论数: {current_cc}")
 
-            metric_line = '   '.join(metric_parts) if metric_parts else '👍 指标: (无变化)'
+            metric_line = '   '.join(metric_parts)
             trans_only = ' [仅翻译补全]' if u.get('_translation_only') else ''
             changes_str = '; '.join(other_changes) if other_changes else '(无其他变更)'
             print(f"  {i:>3}. [{cat_str}]{trans_only}")
@@ -2877,7 +2910,7 @@ def main():
         sys.exit(1)
 
     # Collect papers
-    print("[INFO] [1/7] 收集 webarchive 与网页源 …")
+    print("[INFO] [1/6] 收集 webarchive 与网页源 …")
     class SourceArgs:
         pass
     sa = SourceArgs()
@@ -2901,21 +2934,21 @@ def main():
                         seen.add(p['paper_id'])
                         added += 1
                 print(f"[INFO]     {fp}: 提取 {len(ps)} 篇，新增 {added} 篇去重后）")
-    print(f"[INFO] [2/7] 解析 JSON-LD + DOM：共提取 {len(papers)} 篇论文元数据")
+    print(f"[INFO] [2/6] 解析 JSON-LD + DOM：共提取 {len(papers)} 篇论文元数据")
 
     # Time filter
     before_cnt = len(papers)
     if after_dt or before_dt:
         papers = [p for p in papers if paper_in_range(p['published_date'], after_dt, before_dt)]
-        print(f"[INFO] [3/7] 时间过滤：保留 {len(papers)}/{before_cnt} 篇论文")
+        print(f"[INFO] [3/6] 时间过滤：保留 {len(papers)}/{before_cnt} 篇论文")
     else:
-        print(f"[INFO] [3/7] 无时间过滤：保留全部 {before_cnt} 篇论文")
+        print(f"[INFO] [3/6] 无时间过滤：保留全部 {before_cnt} 篇论文")
 
     # Likes filter: drop papers below --min-likes threshold (dynamic category default)
     likes_before = len(papers)
     min_likes = args.min_likes
     papers = [p for p in papers if p.get('likes', 0) >= min_likes]
-    print(f"[INFO] [3.5/7] 点赞过滤（likes >= {min_likes}，{_min_likes_source}）：保留 {len(papers)}/{likes_before} 篇论文")
+    print(f"[INFO] [3.5/6] 点赞过滤（likes >= {min_likes}，{_min_likes_source}）：保留 {len(papers)}/{likes_before} 篇论文")
 
     if not papers:
         print("[WARN] No papers to process. Exiting.")
@@ -2931,10 +2964,33 @@ def main():
         auto_confirm=args.yes,
     )
     if confirmed:
-        build_and_save_report(conn, new_ids, updated, new_comments, rank_before, rank_after,
-                              trans_updates, comment_trans, args)
+        now = datetime.now()
+        print()
+        print("=" * 80)
+        print(f"PaperGrep 运行完成 — {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 80)
+        print(f"  🆕 新增论文       {len(new_ids)} 篇")
+        print(f"  🔄 更新论文       {len(updated)} 篇")
+        print(f"  💬 新/更新评论    {len(new_comments)} 条")
+        if trans_updates:
+            n_t = sum(1 for t in trans_updates if 'title_zh' in t['fields'])
+            n_a = sum(1 for t in trans_updates if 'abstract_zh' in t['fields'])
+            n_o = sum(1 for t in trans_updates if 'ai_overview_zh' in t['fields'])
+            parts = []
+            if n_t: parts.append(f"标题翻译 {n_t}")
+            if n_a: parts.append(f"摘要翻译 {n_a}")
+            if n_o: parts.append(f"AI Overview 中文概述 {n_o}")
+            if parts:
+                print(f"  🌐 论文翻译补充    {' | '.join(parts)}  篇")
+        if comment_trans:
+            print(f"  🌐 评论翻译补充    {len(comment_trans)} 条")
+        print("=" * 80)
+        print(f"  🗄️  数据库        {DB_PATH}")
+        print("=" * 80)
+        print()
+        print("[INFO] [6/6] 完成 ✅")
     else:
-        print("[INFO] 用户取消写入，未生成报告，程序正常退出。")
+        print("[INFO] 用户取消写入，程序正常退出。")
     conn.close()
 
 
