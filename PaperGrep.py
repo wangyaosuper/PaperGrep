@@ -61,10 +61,14 @@ def ensure_dirs():
 
 def get_db():
     ensure_dirs()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint=2000")
+    conn.execute("PRAGMA temp_store=MEMORY")
     return conn
 
 
@@ -1501,6 +1505,12 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     """Insert/update papers, detect changes, trigger translations when needed.
     Categories are additive: if `category` is provided, it is merged (union) into existing categories.
     All DB writes are delayed until after user review (unless auto_confirm=True).
+
+    To avoid holding a write lock during the (potentially long) LLM translation phase,
+    all INSERT/UPDATE statements are collected in-memory first, translation runs with only
+    a read transaction, and the writes are executed in a single short transaction after
+    translation completes.
+
     Returns (new_paper_ids, updated_papers_info, new_comments_info, likes_ranking_before, likes_ranking_after, translation_updates, comment_translations, confirmed)"""
     print(f"[INFO] [4/6] 同步 {len(fetched_papers)} 篇论文（翻译 + 待审核，未写入数据库） …")
     if category:
@@ -1516,6 +1526,11 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     updated = []
     new_comments = []
     paper_categories = {}
+
+    # In-memory staging: collect all writes here, execute after translation
+    pending_paper_sql = []        # list of (sql, params)
+    pending_comment_sql = []      # list of (sql, params, tmp_id_or_None)
+    tmp_comment_id_counter = [-1] # negative ids for not-yet-inserted comments
 
     # 1) Per-paper fetch details (optional) in parallel
     if fetch_details:
@@ -1539,7 +1554,7 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
         detail_results = {}
         print(f"[INFO]   --no-details: 跳过详情页抓取")
 
-    print(f"[INFO]   写入/对比 {len(fetched_papers)} 篇论文元数据 …")
+    print(f"[INFO]   对比 {len(fetched_papers)} 篇论文元数据（暂存变更，尚未写入数据库） …")
     for i, p in enumerate(fetched_papers, 1):
         pid = p['paper_id']
         details = detail_results.get(pid, {})
@@ -1562,21 +1577,24 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
             ai_overview = ai_overview_incoming
             new_categories = [category] if category else []
             paper_categories[pid] = list(new_categories)
-            c.execute("""
+            sql = """
                 INSERT INTO papers (paper_id, url, title_en, abstract_en, ai_overview_en, authors_json,
                     published_date, modified_date, likes, views, comment_count,
                     title_hash, abstract_hash, ai_overview_hash, translated_fields,
                     first_seen, last_updated, categories_json)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
+            """
+            params = (
                 pid, p['url'], title, abstract_full, ai_overview, authors_json,
                 p['published_date'], p['modified_date'], p['likes'], p['views'],
                 max(cc, 0),
                 new_title_hash, new_abstract_hash, new_ai_overview_hash, '{}',
                 now, now, json.dumps(new_categories, ensure_ascii=False)
-            ))
+            )
+            pending_paper_sql.append((sql, params))
             new_paper_ids.append(pid)
-            _sync_comments_for(conn, pid, comments, new_comments, now)
+            _collect_comment_changes(conn, pid, comments, new_comments, pending_comment_sql,
+                                     tmp_comment_id_counter, now)
             continue
 
         # UPDATE path: use hash to decide content updates; likes/views always refreshed
@@ -1654,36 +1672,43 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
         paper_categories[pid] = list(merged_categories)
         merged_categories_json = json.dumps(merged_categories, ensure_ascii=False)
 
-        c.execute("""
+        sql = """
             UPDATE papers SET
                 url=?, title_en=?, abstract_en=?, ai_overview_en=?, authors_json=?,
                 published_date=?, modified_date=?, likes=?, views=?, comment_count=?,
                 title_hash=?, abstract_hash=?, ai_overview_hash=?, translated_fields=?,
                 last_updated=?, categories_json=?
             WHERE paper_id=?
-        """, (
+        """
+        params = (
             p['url'], store_title, store_abstract, store_overview, authors_json,
             p['published_date'], p['modified_date'], p['likes'], p['views'], max(cc, 0),
             store_title_hash, store_abstract_hash, store_overview_hash,
             json.dumps(translated, ensure_ascii=False), now, merged_categories_json, pid
-        ))
+        )
+        pending_paper_sql.append((sql, params))
 
         if changes:
             updated.append({'paper_id': pid, 'title_en': title, 'title_zh': prev.get('title_zh') or '', 'changes': changes})
 
-        _sync_comments_for(conn, pid, comments, new_comments, now)
+        _collect_comment_changes(conn, pid, comments, new_comments, pending_comment_sql,
+                                 tmp_comment_id_counter, now)
 
         if i % 10 == 0 or i == len(fetched_papers):
-            print(f"[INFO]     元数据暂存 {i}/{len(fetched_papers)} (新增 {len(new_paper_ids)}，更新 {len(updated)}) — 尚未写入数据库")
+            print(f"[INFO]     元数据对比 {i}/{len(fetched_papers)} (新增 {len(new_paper_ids)}，更新 {len(updated)}) — 尚未写入数据库")
 
-    print(f"[INFO]   元数据暂存完成：新增 {len(new_paper_ids)}，更新 {len(updated)}，新评论 {len(new_comments)} — 待翻译完成后统一审核并写入")
+    print(f"[INFO]   元数据对比完成：新增 {len(new_paper_ids)}，更新 {len(updated)}，新评论 {len(new_comments)} — 待翻译完成后统一审核并写入")
 
     # 2) Collect translation tasks (batch)
-    #   集合 A：本次新入库或字段更新的论文（recent_set）
+    #   集合 A：本次新增或更新的论文（recent_set）
     #   集合 B：本次 fetched_papers（因为内容可能刷新但 hash 未变，仍需检查缺译）
     #   集合 C：整个 papers 表中翻译字段不全的所有历史论文（补全历史遗漏）—— 限制最多 500 篇，避免一次性开销过大
     recent_set = set(new_paper_ids) | {u['paper_id'] for u in updated}
     fetched_ids = [p['paper_id'] for p in fetched_papers]
+
+    # --- Build a merged row map: DB rows + in-memory staged rows ---
+    # (because the staged INSERTs haven't been written yet, we must synthesize rows for them)
+    # Start with DB rows:
     c.execute("""
         SELECT paper_id FROM papers
         WHERE (translated_fields IS NULL OR json_extract(translated_fields, '$.title_zh') IS NULL AND title_en IS NOT NULL AND title_en != '')
@@ -1706,33 +1731,151 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
             d = dict(r)
             rows.append(d)
             row_map[d['paper_id']] = d
+
+    # Now synthesize rows for new papers not yet in DB: use the pending INSERT params we staged
+    # Re-construct a dict from pending_paper_sql INSERT params for papers not in row_map:
+    fetched_map_for_row = {p['paper_id']: p for p in fetched_papers}
+    for (sql, params) in pending_paper_sql:
+        # Only handle INSERTs (UPDATEs affect papers already in row_map)
+        if not sql.strip().upper().startswith('INSERT'):
+            continue
+        pid = params[0]
+        if pid in row_map:
+            continue
+        # Params order in INSERT: paper_id, url, title_en, abstract_en, ai_overview_en, authors_json,
+        #   published_date, modified_date, likes, views, comment_count,
+        #   title_hash, abstract_hash, ai_overview_hash, translated_fields,
+        #   first_seen, last_updated, categories_json
+        synth = {
+            'paper_id': params[0],
+            'url': params[1],
+            'title_en': params[2],
+            'abstract_en': params[3],
+            'ai_overview_en': params[4],
+            'authors_json': params[5],
+            'published_date': params[6],
+            'modified_date': params[7],
+            'likes': params[8],
+            'views': params[9],
+            'comment_count': params[10],
+            'title_hash': params[11],
+            'abstract_hash': params[12],
+            'ai_overview_hash': params[13],
+            'translated_fields': params[14],
+            'first_seen': params[15],
+            'last_updated': params[16],
+            'categories_json': params[17],
+            'title_zh': None,
+            'abstract_zh': None,
+            'ai_overview_zh': None,
+            'ai_overview_summary_zh': None,
+        }
+        rows.append(synth)
+        row_map[pid] = synth
+
+    # Also apply pending UPDATEs to row_map (so translations see the latest fields)
+    for (sql, params) in pending_paper_sql:
+        if not sql.strip().upper().startswith('UPDATE'):
+            continue
+        # UPDATE params order: url, title_en, abstract_en, ai_overview_en, authors_json,
+        #   published_date, modified_date, likes, views, comment_count,
+        #   title_hash, abstract_hash, ai_overview_hash, translated_fields,
+        #   last_updated, categories_json, paper_id
+        pid = params[-1]
+        existing = row_map.get(pid)
+        if existing is None:
+            continue
+        existing['url'] = params[0]
+        existing['title_en'] = params[1]
+        existing['abstract_en'] = params[2]
+        existing['ai_overview_en'] = params[3]
+        existing['authors_json'] = params[4]
+        existing['published_date'] = params[5]
+        existing['modified_date'] = params[6]
+        existing['likes'] = params[7]
+        existing['views'] = params[8]
+        existing['comment_count'] = params[9]
+        existing['title_hash'] = params[10]
+        existing['abstract_hash'] = params[11]
+        existing['ai_overview_hash'] = params[12]
+        existing['translated_fields'] = params[13]
+        existing['last_updated'] = params[14]
+        existing['categories_json'] = params[15]
+
     history_candidates_only = [pid for pid in history_ids if pid not in recent_set and pid not in set(fetched_ids)]
     if history_candidates_only:
         print(f"[INFO]   发现 {len(history_candidates_only)} 篇历史论文翻译字段不全，将一并纳入本次补全队列")
 
+    # Merge in-memory comment staging + DB comment rows for untranslated-comment discovery
+    # db comments map: id -> dict
+    c.execute("""
+        SELECT c.id, c.paper_id, c.content_en, c.content_zh FROM comments c
+    """)
+    db_comment_rows = [dict(r) for r in c.fetchall()]
+    # Build synthetic comment rows for comments staged as INSERTs (use tmp negative id)
+    all_comment_rows = list(db_comment_rows)
+    tmp_id_to_comment = {}
+    for (c_sql, c_params, tmp_id) in pending_comment_sql:
+        if tmp_id is None:
+            continue  # UPDATE or last_updated touch
+        if not c_sql.strip().upper().startswith('INSERT'):
+            continue
+        # INSERT params: paper_id, external_id, author_name, content_en, published_at, content_hash
+        synth_c = {
+            'id': tmp_id,
+            'paper_id': c_params[0],
+            'external_id': c_params[1],
+            'author_name': c_params[2],
+            'content_en': c_params[3],
+            'published_at': c_params[4],
+            'content_hash': c_params[5],
+            'content_zh': None,
+        }
+        all_comment_rows.append(synth_c)
+        tmp_id_to_comment[tmp_id] = synth_c
+    # Apply pending comment UPDATEs (content_en refresh sets content_zh NULL)
+    for (c_sql, c_params, tmp_id) in pending_comment_sql:
+        if tmp_id is not None:
+            continue
+        if not c_sql.strip().upper().startswith('UPDATE') or 'comments' not in c_sql.lower():
+            continue
+        # UPDATE params: author_name, content_en, published_at, content_hash, id
+        update_id = c_params[-1]
+        for acr in all_comment_rows:
+            if acr['id'] == update_id:
+                acr['author_name'] = c_params[0]
+                acr['content_en'] = c_params[1]
+                acr['published_at'] = c_params[2]
+                acr['content_hash'] = c_params[3]
+                acr['content_zh'] = None
+                break
+
     tasks = []
     for r in rows:
-        translated = json.loads(r['translated_fields'] or '{}')
-        if r['title_en'] and not translated.get('title_zh'):
+        translated = json.loads(r.get('translated_fields') or '{}')
+        if r.get('title_en') and not translated.get('title_zh'):
             tasks.append((f"TITLE::{r['paper_id']}", r['title_en']))
-        if r['abstract_en'] and not translated.get('abstract_zh'):
+        if r.get('abstract_en') and not translated.get('abstract_zh'):
             tasks.append((f"ABSTRACT::{r['paper_id']}", r['abstract_en']))
         # AI Overview: 生成约 1500 字中文结构化概述（覆盖 8 个维度：动机/相关工作/方法细节/创新点/实验设置/结果分析/局限与未来/应用价值；不做逐字翻译避免公式/伪代码失真）
-        if r['ai_overview_en'] and not translated.get('ai_overview_zh'):
+        if r.get('ai_overview_en') and not translated.get('ai_overview_zh'):
             tasks.append((f"OVERVIEW::{r['paper_id']}", r['ai_overview_en']))
 
     # Also collect untranslated comments (补全所有历史缺译评论，不限制条数以保证数据库一致性)
-    c.execute("""
-        SELECT c.id, c.paper_id, c.content_en FROM comments c
-        WHERE (c.content_zh IS NULL OR c.content_zh = '') AND c.content_en IS NOT NULL AND c.content_en != ''
-    """)
-    comment_rows = c.fetchall()
-    if comment_rows:
-        print(f"[INFO]   发现 {len(comment_rows)} 条未翻译评论，将一并补全")
-    for cr in comment_rows:
+    untranslated_comments = [
+        cr for cr in all_comment_rows
+        if (cr.get('content_zh') is None or cr.get('content_zh') == '')
+           and cr.get('content_en') is not None and cr.get('content_en') != ''
+    ]
+    if untranslated_comments:
+        print(f"[INFO]   发现 {len(untranslated_comments)} 条未翻译评论，将一并补全")
+    for cr in untranslated_comments:
         tasks.append((f"COMMENT::{cr['id']}", cr['content_en']))
 
     print(f"[INFO] [5/6] 调用大模型翻译：共 {len(tasks)} 项待翻译 (model={translator.model}) …")
+    # Release any open read transaction so DBViewer can fully use the DB
+    # (WAL mode readers don't block writers, but releasing read snapshot still helps checkpointing)
+    conn.commit()
     by_paper_updates = {}
     comment_updates = []
     if tasks:
@@ -1742,27 +1885,27 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
         translated_map = translator.translate_batch(tasks)
         got = len(translated_map)
         print(f"[INFO]   翻译返回：{got}/{len(tasks)} 条结果")
-        # Apply translations
+        # Apply translations (in-memory only — SQLs are staged, not executed)
         for key, zh in translated_map.items():
             if not zh:
                 continue
             kind, _, rest = key.partition('::')
             if kind == 'TITLE':
                 pid = rest
-                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
+                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid].get('translated_fields') or '{}')})
                 prev['title_zh'] = zh
                 prev['translated']['title_zh'] = True
                 by_paper_updates[pid] = prev
             elif kind == 'ABSTRACT':
                 pid = rest
-                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
+                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid].get('translated_fields') or '{}')})
                 prev['abstract_zh'] = zh
                 prev['translated']['abstract_zh'] = True
                 by_paper_updates[pid] = prev
             elif kind == 'OVERVIEW_B' or kind == 'OVERVIEW_S' or kind == 'OVERVIEW_F' or kind == 'OVERVIEW':
                 # OVERVIEW 是纯字符串：约 1500 字中文结构化概述（非逐字翻译；覆盖 8 个维度从动机到应用价值）
                 pid = rest
-                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid]['translated_fields'] or '{}')})
+                prev = by_paper_updates.get(pid, {'title_zh': None, 'abstract_zh': None, 'ai_overview_zh': None, 'translated': json.loads(row_map[pid].get('translated_fields') or '{}')})
                 overview_text = str(zh).strip()
                 if overview_text:
                     prev['ai_overview_zh'] = overview_text
@@ -1775,21 +1918,37 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
                     continue
                 comment_updates.append((zh, cid))
 
+        # Stage translation UPDATE SQLs into pending_paper_sql + pending_comment_sql
         for pid, up in by_paper_updates.items():
             r = row_map[pid]
-            title_zh = up['title_zh'] if up['title_zh'] is not None else r['title_zh']
-            abstract_zh = up['abstract_zh'] if up['abstract_zh'] is not None else r['abstract_zh']
-            overview_zh = up['ai_overview_zh'] if up['ai_overview_zh'] is not None else r['ai_overview_zh']
+            title_zh = up['title_zh'] if up['title_zh'] is not None else r.get('title_zh')
+            abstract_zh = up['abstract_zh'] if up['abstract_zh'] is not None else r.get('abstract_zh')
+            overview_zh = up['ai_overview_zh'] if up['ai_overview_zh'] is not None else r.get('ai_overview_zh')
             overview_s_zh = overview_zh
-            c.execute("""
+            sql = """
                 UPDATE papers SET title_zh=?, abstract_zh=?, ai_overview_zh=?, ai_overview_summary_zh=?, translated_fields=?, last_updated=?
                 WHERE paper_id=?
-            """, (
+            """
+            params = (
                 title_zh, abstract_zh, overview_zh, overview_s_zh,
                 json.dumps(up['translated'], ensure_ascii=False), now, pid
-            ))
+            )
+            pending_paper_sql.append((sql, params))
         for zh, cid in comment_updates:
-            c.execute("UPDATE comments SET content_zh=? WHERE id=?", (zh, cid))
+            if cid < 0:
+                # Staged comment INSERT: use UPDATE with the temporary id placeholder
+                # (We'll remap to the real rowid after the INSERT runs at commit time.)
+                pending_comment_sql.append((
+                    "UPDATE comments SET content_zh=? WHERE id=?",
+                    (zh, cid),
+                    cid,  # mark with tmp_id so we can remap
+                ))
+            else:
+                pending_comment_sql.append((
+                    "UPDATE comments SET content_zh=? WHERE id=?",
+                    (zh, cid),
+                    None,
+                ))
             # 同步标记 new_comments 里已翻译并保存 content_zh
             updated_markers = []
             for nc in new_comments:
@@ -1860,15 +2019,24 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
 
     comment_translations = []
     for zh, cid in comment_updates:
-        crs = c.execute("SELECT paper_id, author_name, content_en FROM comments WHERE id=?", (cid,)).fetchone()
+        crs = None
+        if cid < 0:
+            # Staged comment: look up tmp_id_to_comment
+            sc = tmp_id_to_comment.get(cid)
+            if sc is not None:
+                crs = sc
+        else:
+            crs = c.execute("SELECT id, paper_id, author_name, content_en FROM comments WHERE id=?", (cid,)).fetchone()
+            if crs is not None:
+                crs = dict(crs)
         if crs:
             comment_translations.append({
                 'comment_id': cid,
                 'paper_id': crs['paper_id'],
-                'author': crs['author_name'] or '',
-                'before_len': len(crs['content_en'] or ''),
+                'author': crs.get('author_name') or '',
+                'before_len': len(crs.get('content_en') or ''),
                 'after_len': len(zh),
-                'preview_en': _clip(crs['content_en'] or '', 160),
+                'preview_en': _clip(crs.get('content_en') or '', 160),
                 'preview_zh': _clip(zh, 160),
             })
             for nc in new_comments:
@@ -1876,13 +2044,40 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
                     nc['content_zh'] = zh
                     nc['translated'] = True
 
-    # Ranking after
-    c.execute("SELECT paper_id, title_en, title_zh, likes FROM papers ORDER BY likes DESC, first_seen ASC LIMIT 50")
-    ranking_after = [dict(r) for r in c.fetchall()]
+    # Ranking after — compute from merged in-memory state
+    # Start with DB rows, then overlay staged inserts/updates
+    c.execute("SELECT paper_id, title_en, title_zh, likes, first_seen FROM papers")
+    all_rank_rows = {}
+    for r in c.fetchall():
+        d = dict(r)
+        all_rank_rows[d['paper_id']] = d
+    for (sql, params) in pending_paper_sql:
+        if sql.strip().upper().startswith('INSERT'):
+            pid = params[0]
+            all_rank_rows[pid] = {
+                'paper_id': params[0],
+                'title_en': params[2],
+                'title_zh': None,
+                'likes': params[8],
+                'first_seen': params[15],
+            }
+    # Apply translation title_zh updates for ranking display:
+    for pid, up in by_paper_updates.items():
+        if up.get('title_zh') is not None and pid in all_rank_rows:
+            all_rank_rows[pid]['title_zh'] = up['title_zh']
+    # Sort by likes DESC, first_seen ASC and take top 50
+    rank_list = list(all_rank_rows.values())
+    rank_list.sort(key=lambda x: (-(x.get('likes') or 0), x.get('first_seen') or ''))
+    ranking_after = [
+        {k: d[k] for k in ('paper_id', 'title_en', 'title_zh', 'likes') if k in d}
+        for d in rank_list[:50]
+    ]
 
     # ============================================================
     # REVIEW & CONFIRM before DB write
     # ============================================================
+    # Release read transaction before the interactive prompt (user may take a while)
+    conn.commit()
     print()
     print("=" * 80)
     print("[REVIEW] 待写入数据库审核清单（全部翻译已完成，尚未 COMMIT）")
@@ -2118,6 +2313,35 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     print()
 
     if confirmed:
+        # Execute all staged SQL in one short transaction:
+        # 1) paper INSERTs/UPDATEs + translation UPDATEs
+        for (sql, params) in pending_paper_sql:
+            c.execute(sql, params)
+        # 2) comment INSERTs (capture real rowids) + UPDATEs + translation UPDATEs
+        tmp_id_to_real_id = {}
+        for (sql, params, tmp_id) in pending_comment_sql:
+            if tmp_id is not None and sql.strip().upper().startswith('INSERT'):
+                c.execute(sql, params)
+                real_id = c.lastrowid
+                tmp_id_to_real_id[tmp_id] = real_id
+            elif tmp_id is not None:
+                # Translation UPDATE for a staged-new comment: remap the id
+                remapped_params = (params[0], tmp_id_to_real_id.get(params[1], params[1]))
+                c.execute(sql, remapped_params)
+            else:
+                c.execute(sql, params)
+        # Remap new_comments comment_db_id from tmp negative to real id
+        for nc in new_comments:
+            tmp = nc.get('comment_db_id')
+            if isinstance(tmp, int) and tmp < 0:
+                nc['comment_db_id'] = tmp_id_to_real_id.get(tmp, tmp)
+                if '_tmp_id' in nc:
+                    del nc['_tmp_id']
+        # Also remap comment_translations comment_id
+        for ct in comment_translations:
+            cid = ct.get('comment_id')
+            if isinstance(cid, int) and cid < 0:
+                ct['comment_id'] = tmp_id_to_real_id.get(cid, cid)
         conn.commit()
         print(f"[INFO] ✅ 已确认写入：新增 {len(new_paper_ids)}，更新 {len(updated)}，翻译 {len(translation_updates)} 篇论文 + {len(comment_translations)} 条评论")
     else:
@@ -2129,7 +2353,84 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
             translation_updates, comment_translations, confirmed)
 
 
+def _collect_comment_changes(conn, paper_id, incoming_comments, new_comments_tracker, pending_comment_sql,
+                             tmp_comment_id_counter, now_iso=None):
+    """Collect comment INSERT/UPDATE statements into pending_comment_sql (without executing them).
+    New comments are assigned a temporary negative id (stored as comment_db_id) so that
+    translation tasks can reference them before the real rowid is known.
+
+    pending_comment_sql entries: (sql, params, tmp_id_or_None)
+      - For INSERT: tmp_id is a negative int (the temporary id)
+      - For UPDATE: tmp_id is None (uses the real existing id)
+    """
+    if not incoming_comments:
+        return False
+    if now_iso is None:
+        now_iso = datetime.now().isoformat(timespec='seconds')
+    c = conn.cursor()
+    paper_touched = False
+    for ic in incoming_comments:
+        ext_id = str(ic.get('id') or '')
+        content_en = str(ic.get('content') or '').strip()
+        if not content_en:
+            continue
+        chash = content_hash(content_en)
+        author = str(ic.get('author') or '')
+        pub_at = str(ic.get('published_at') or '')
+        if ext_id:
+            c.execute("SELECT id, content_hash, content_en FROM comments WHERE paper_id=? AND external_id=?", (paper_id, ext_id))
+        else:
+            c.execute("SELECT id, content_hash, content_en FROM comments WHERE paper_id=? AND content_hash=?", (paper_id, chash))
+        row = c.fetchone()
+        if row is None:
+            tmp_id = tmp_comment_id_counter[0]
+            tmp_comment_id_counter[0] -= 1
+            sql = """
+                INSERT INTO comments (paper_id, external_id, author_name, content_en, published_at, content_hash)
+                VALUES (?,?,?,?,?,?)
+            """
+            params = (paper_id, ext_id, author, content_en, pub_at, chash)
+            pending_comment_sql.append((sql, params, tmp_id))
+            new_comments_tracker.append({
+                'comment_db_id': tmp_id,
+                'paper_id': paper_id,
+                'author': author,
+                'content_en': content_en,
+                'published_at': pub_at,
+                'translated': False,
+                '_tmp_id': tmp_id,
+            })
+            paper_touched = True
+        else:
+            db_id = row['id']
+            if row['content_hash'] != chash and len(content_en) > len(row['content_en'] or ''):
+                sql = """
+                    UPDATE comments SET author_name=?, content_en=?, published_at=?, content_hash=?, content_zh=NULL, is_updated=1
+                    WHERE id=?
+                """
+                params = (author, content_en, pub_at, chash, db_id)
+                pending_comment_sql.append((sql, params, None))
+                new_comments_tracker.append({
+                    'comment_db_id': db_id,
+                    'paper_id': paper_id,
+                    'author': author,
+                    'content_en': content_en,
+                    'published_at': pub_at,
+                    'updated': True,
+                    'translated': False,
+                })
+                paper_touched = True
+    if paper_touched:
+        pending_comment_sql.append((
+            "UPDATE papers SET last_updated=? WHERE paper_id=?",
+            (now_iso, paper_id),
+            None,
+        ))
+    return paper_touched
+
+
 def _sync_comments_for(conn, paper_id, incoming_comments, new_comments_tracker, now_iso=None):
+    """In-place comment sync (used by --refill mode which commits incrementally)."""
     if not incoming_comments:
         return
     if now_iso is None:
@@ -2936,19 +3237,43 @@ def main():
                 print(f"[INFO]     {fp}: 提取 {len(ps)} 篇，新增 {added} 篇去重后）")
     print(f"[INFO] [2/6] 解析 JSON-LD + DOM：共提取 {len(papers)} 篇论文元数据")
 
+    # Count how many extracted papers are brand new (not in DB yet)
+    def _count_new_papers(conn, paper_list):
+        if not paper_list:
+            return 0, set()
+        ids = [p['paper_id'] for p in paper_list]
+        placeholders = ','.join('?' * len(ids))
+        cur = conn.cursor()
+        cur.execute(f"SELECT paper_id FROM papers WHERE paper_id IN ({placeholders})", ids)
+        existing = {r[0] for r in cur.fetchall()}
+        new_count = sum(1 for pid in ids if pid not in existing)
+        return new_count, existing
+
+    new_extracted, existing_ids_at_extract = _count_new_papers(conn, papers)
+    already_in_db_extract = len(papers) - new_extracted
+    print(f"[INFO] [2/6]   其中新论文 {new_extracted} 篇（尚未入库），已在库 {already_in_db_extract} 篇")
+
     # Time filter
     before_cnt = len(papers)
+    new_before_cnt = new_extracted
     if after_dt or before_dt:
         papers = [p for p in papers if paper_in_range(p['published_date'], after_dt, before_dt)]
-        print(f"[INFO] [3/6] 时间过滤：保留 {len(papers)}/{before_cnt} 篇论文")
+        new_after_time = sum(1 for p in papers if p['paper_id'] not in existing_ids_at_extract)
+        print(f"[INFO] [3/6] 时间过滤：保留 {len(papers)}/{before_cnt} 篇论文（其中新论文 {new_after_time}/{new_before_cnt} 篇）")
     else:
-        print(f"[INFO] [3/6] 无时间过滤：保留全部 {before_cnt} 篇论文")
+        print(f"[INFO] [3/6] 无时间过滤：保留全部 {before_cnt} 篇论文（其中新论文 {new_before_cnt} 篇）")
+        new_after_time = new_before_cnt
 
     # Likes filter: drop papers below --min-likes threshold (dynamic category default)
     likes_before = len(papers)
+    new_before_likes = new_after_time
     min_likes = args.min_likes
     papers = [p for p in papers if p.get('likes', 0) >= min_likes]
-    print(f"[INFO] [3.5/6] 点赞过滤（likes >= {min_likes}，{_min_likes_source}）：保留 {len(papers)}/{likes_before} 篇论文")
+    new_kept_after_likes = sum(1 for p in papers if p['paper_id'] not in existing_ids_at_extract)
+    new_filtered_by_likes = new_before_likes - new_kept_after_likes
+    print(f"[INFO] [3.5/6] 点赞过滤（likes >= {min_likes}，{_min_likes_source}）：保留 {len(papers)}/{likes_before} 篇论文"
+          f"（其中新论文 {new_kept_after_likes}/{new_before_likes} 篇"
+          f"；低于 likes 阈值被过滤的新论文 = {new_filtered_by_likes} 篇）")
 
     if not papers:
         print("[WARN] No papers to process. Exiting.")
