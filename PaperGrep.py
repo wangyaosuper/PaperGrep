@@ -2126,7 +2126,14 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
         for i, u in enumerate(updated, 1):
             pid = u['paper_id']
             title = u.get('title_en') or pid
-            cats = paper_categories.get(pid, [])
+            cats = paper_categories.get(pid)
+            # 回退：历史补全论文（集合 C）未进入 fetched_papers 主循环，
+            # paper_categories 中无记录，此时从 row_map 读取数据库中已有的类别
+            if cats is None:
+                try:
+                    cats = json.loads((row_map.get(pid) or {}).get('categories_json') or '[]') or []
+                except Exception:
+                    cats = []
             cat_str = ', '.join(cats) if cats else '(无)'
             # Extract metric deltas first
             likes_before = None
