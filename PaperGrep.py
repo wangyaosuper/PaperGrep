@@ -1501,6 +1501,26 @@ def _clip(s, n):
     return (s[:n] + '…') if len(s) > n else s
 
 
+def _flush_stdin_input():
+    """Discard any keystrokes buffered on stdin during long-running operations.
+
+    Long phases (e.g. LLM translation) can take minutes. If the user accidentally
+    presses keys during that time, those bytes pile up in the terminal input
+    buffer and get consumed by the next ``input()`` prompt — typically causing an
+    unintended "cancel" that discards all staged work. Flushing stdin right before
+    the interactive prompt ensures the prompt starts from a clean state.
+
+    Only effective when stdin is a TTY; a no-op otherwise (piped input is kept).
+    """
+    try:
+        if sys.stdin.isatty():
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        # termios is Unix-only; on non-TTY / unsupported platforms just skip.
+        pass
+
+
 def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=None, auto_confirm=False):
     """Insert/update papers, detect changes, trigger translations when needed.
     Categories are additive: if `category` is provided, it is merged (union) into existing categories.
@@ -2306,6 +2326,10 @@ def sync_papers(conn, fetched_papers, translator, fetch_details=True, category=N
     else:
         while True:
             try:
+                # Clear any keystrokes buffered during the long translation phase
+                # so they don't get consumed by this prompt and trigger an
+                # unintended cancel that rolls back all staged work.
+                _flush_stdin_input()
                 ans = input("请审核上述清单后确认写入数据库？输入 y 确认写入，输入其他任意键取消 (y/N): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
